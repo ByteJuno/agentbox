@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""
+agentctl（2026-10-26）：agent-hub 的命令行，走 ~/.agent-hub/hub.sock。本机调试用，
+Telegram 审批按钮的回调（bot_listener.py）也是转成 agentctl approve/deny。
+
+  agentctl list [--all]                        hub 里的会话；--all 再列 lab 上最近的其它 Claude Code 会话
+  agentctl new [--cwd 目录] [--name 名字] [--mode default|acceptEdits|plan|auto] [--wait] [--quiet] 提示词…
+  agentctl send ID [--wait] [--quiet] 消息…     接着某个会话干（ID 给前几位就行；list --all 里的会话会被接手）
+  agentctl wait ID [--timeout 秒]               等这一轮做完，或者等到它卡在审批上
+  agentctl status ID | history ID [--limit N] | adopt ID
+  agentctl pending | approve 请求ID | deny 请求ID [--reason 原因]
+  agentctl answer 问题ID [--option N | --skip | --response 文字 | "问题原文=回答" …]
+  agentctl withdraw ID 排队ID                   撤回还没开始的排队消息
+  agentctl stop ID
+  agentctl model ID [--model claude-opus-5-5|…|""] [--effort low|medium|high|xhigh|max|""]
+  agentctl mode ID default|acceptEdits|plan|auto|bypassPermissions   切换权限（bypassPermissions = 全部自动通过）
+  agentctl token                               打印 Eta 连接用的地址和令牌（只在自己的终端里看）
+
+提示词或消息写成 - 就从标准输入读，长文本或带引号的内容用这个。每个命令都可以加 --json。
+退出码：0 正常，1 出错，2 wait 超时，3 在等审批。
+"""
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+
+STATE_DIR = os.path.expanduser(os.environ.get("AGENT_HUB_STATE", "~/.agent-hub"))
+SOCK_PATH = os.path.join(STATE_DIR, "hub.sock")
+STATUS = {"idle": "空闲", "running": "运行中", "waiting": "等审批", "error": "出错", "interrupted": "已中断"}
+KIND = {"user": "你", "assistant": "Claude", "tool_use": "调用", "tool_result": "结果"}
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def call(req, timeout=30):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(SOCK_PATH)
+    except (FileNotFoundError, ConnectionRefusedError):
+        die("agent-hub 没在运行（systemctl --user status agent-hub）")
+    sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode())
+    buf = b""
+    try:
+        while not buf.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    except socket.timeout:
+        die("agent-hub 没有及时回应")
+    finally:
+        sock.close()
+    resp = json.loads(buf) if buf else {"ok": False, "error": "agent-hub 没有回应"}
+    if not resp.get("ok"):
+        die(resp.get("error") or "出错了")
+    return resp
+
+
+def ago(ts):
+    secs = int(time.time() - ts)
+    if secs < 60:
+        return "刚刚"
+    if secs < 3600:
+        return f"{secs // 60} 分钟前"
+    if secs < 86400:
+        return f"{secs // 3600} 小时前"
+    return f"{secs // 86400} 天前"
+
+
+def text_arg(words):
+    text = sys.stdin.read() if words == ["-"] else " ".join(words)
+    if not text.strip():
+        die("缺少提示词")
+    return text
+
+
+def session_line(s):
+    cost = f"${s['total_cost']:.2f}" if s.get("total_cost") else ""
+    return (f"{s['id'][:8]}  {STATUS.get(s['status'], s['status'])}  {s['name']}  {s['cwd']}  "
+            f"{s['turns']} 轮 {cost}  {ago(s['updated'])}").rstrip()
+
+
+def print_pending(rows):
+    approvals = [p for p in rows if p["kind"] == "approval"]
+    for p in approvals:
+        first = (p["summary"].splitlines() or [""])[0]
+        print(f"请求 {p['req']}  {p['session']}  {p['tool']}：{first}")
+    if approvals:
+        print("批准：agentctl approve <请求ID>；拒绝：agentctl deny <请求ID> [--reason 原因]")
+    for p in rows:
+        if p["kind"] != "question":
+            continue
+        print(f"问题 {p['qid']}  {p['session']}：")
+        for q in p["questions"]:
+            print(f"  {q.get('header') or ''} {q.get('question')}" + ("（可多选）" if q.get("multiSelect") else ""))
+            for i, o in enumerate(q.get("options") or []):
+                print(f"    {i}. {o.get('label')}" + (f" — {o['description']}" if o.get("description") else ""))
+        print(f"回答：agentctl answer {p['qid']} --option N（只有一个问题时）或 \"问题原文=回答\"；跳过：--skip")
+
+
+def print_outcome(resp, timeout):
+    s = resp["session"]
+    if resp.get("timed_out"):
+        print(f"{s['name']} 还在{STATUS.get(s['status'], s['status'])}，{timeout} 秒内没做完（agentctl wait {s['id'][:8]}）")
+        return 2
+    if s["pending"] or s.get("questions"):
+        print(f"{s['name']} 在等你处理：")
+        print_pending(s["pending"] + s.get("questions", []))
+        return 3
+    print(f"{s['name']}：{STATUS.get(s['status'], s['status'])}")
+    if s.get("last_error"):
+        print(f"错误：{s['last_error']}")
+    if s.get("last_result"):
+        print(s["last_result"])
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="agentctl", description="agent-hub 命令行")
+    ap.add_argument("--json", action="store_true", help="输出原始 JSON")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("list")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--limit", type=int, default=15)
+
+    p = sub.add_parser("new")
+    p.add_argument("--cwd", default=os.getcwd())
+    p.add_argument("--name", default="")
+    p.add_argument("--mode", default="default")
+    p.add_argument("--quiet", action="store_true", help="做完不推 Telegram")
+    p.add_argument("--wait", action="store_true")
+    p.add_argument("--timeout", type=int, default=600)
+    p.add_argument("prompt", nargs="+")
+
+    p = sub.add_parser("send")
+    p.add_argument("id")
+    p.add_argument("--mode")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--wait", action="store_true")
+    p.add_argument("--timeout", type=int, default=600)
+    p.add_argument("prompt", nargs="+")
+
+    p = sub.add_parser("wait")
+    p.add_argument("id")
+    p.add_argument("--timeout", type=int, default=600)
+
+    for name in ("status", "adopt", "stop"):
+        sub.add_parser(name).add_argument("id")
+
+    p = sub.add_parser("history")
+    p.add_argument("id")
+    p.add_argument("--limit", type=int, default=10)
+
+    sub.add_parser("pending")
+    sub.add_parser("token")
+
+    p = sub.add_parser("approve")
+    p.add_argument("req")
+    p.add_argument("--via", default="agentctl")
+
+    p = sub.add_parser("deny")
+    p.add_argument("req")
+    p.add_argument("--reason", default="")
+    p.add_argument("--via", default="agentctl")
+
+    p = sub.add_parser("answer")
+    p.add_argument("qid")
+    p.add_argument("pairs", nargs="*", help="问题原文=回答；多选用英文逗号分隔")
+    p.add_argument("--option", type=int, help="只有一个问题时，选第几个选项（从 0 数）")
+    p.add_argument("--skip", action="store_true")
+    p.add_argument("--response", default="", help="不按选项答，直接回一段话")
+    p.add_argument("--via", default="agentctl")
+
+    p = sub.add_parser("model")
+    p.add_argument("id")
+    p.add_argument("--model")
+    p.add_argument("--effort")
+
+    p = sub.add_parser("mode")
+    p.add_argument("id")
+    p.add_argument("mode")
+
+    p = sub.add_parser("withdraw")
+    p.add_argument("id")
+    p.add_argument("qid")
+
+    a = ap.parse_args()
+    out = (lambda r: print(json.dumps(r, ensure_ascii=False, indent=1))) if a.json else None
+
+    if a.cmd == "token":
+        with open(os.path.join(STATE_DIR, "token")) as f:
+            token = f.read().strip()
+        info = call({"cmd": "ping"})
+        print(f"地址：http://100.120.32.105:8765（Tailscale）\n名称：{info['name']}\n令牌：{token}")
+        return 0
+
+    if a.cmd == "list":
+        r = call({"cmd": "list", "all": a.all, "limit": a.limit})
+        if out:
+            return out(r)
+        for s in r["sessions"]:
+            print(session_line(s))
+        if not r["sessions"]:
+            print("agent-hub 里还没有会话")
+        if a.all and r.get("other"):
+            print("\nlab 上其它 Claude Code 会话（agentctl send <ID> 接着干，会自动接手）：")
+            for o in r["other"]:
+                print(f"{o['id'][:8]}  {o['summary']}  {o['cwd']}  {ago(o['updated'])}")
+        return 0
+
+    if a.cmd in ("new", "send"):
+        req = {"cmd": a.cmd, "prompt": text_arg(a.prompt), "quiet": a.quiet, "mode": a.mode}
+        if a.cmd == "new":
+            req.update(cwd=a.cwd, name=a.name)
+        else:
+            req["id"] = a.id
+        resp = call(req)
+        s = resp["session"]
+        if not a.wait:
+            if out:
+                return out(resp)
+            tail = "" if a.quiet else "，做完会推到 Telegram"
+            if resp.get("queued"):
+                print(f"已排队：{s['id'][:8]} {s['name']} 这一轮做完后接着跑（撤回：agentctl withdraw {s['id'][:8]} {resp['queued']}）")
+            else:
+                print(f"已开始：{s['id'][:8]} {s['name']}（{s['cwd']}）{tail}")
+            return 0
+        r = call({"cmd": "wait", "id": s["id"], "timeout": a.timeout}, timeout=a.timeout + 15)
+        return out(r) if out else print_outcome(r, a.timeout)
+
+    if a.cmd == "wait":
+        r = call({"cmd": "wait", "id": a.id, "timeout": a.timeout}, timeout=a.timeout + 15)
+        return out(r) if out else print_outcome(r, a.timeout)
+
+    if a.cmd in ("status", "adopt", "stop"):
+        r = call({"cmd": a.cmd, "id": a.id})
+        if out:
+            return out(r)
+        s = r["session"]
+        print(session_line(s))
+        if a.cmd == "status":
+            if s.get("last_prompt"):
+                print(f"最后一条指令：{s['last_prompt']}")
+            print_outcome({"session": s}, 0)
+        return 0
+
+    if a.cmd == "history":
+        r = call({"cmd": "history", "id": a.id, "limit": a.limit})
+        if out:
+            return out(r)
+        print(f"{r['name']}（{r['id'][:8]}）最近 {len(r['messages'])} 条：")
+        for m in r["messages"]:
+            body = m.get("text") or f"{m.get('name')}：{m.get('summary', '')}"
+            print(f"[{KIND.get(m['kind'], m['kind'])}] {body}")
+        return 0
+
+    if a.cmd == "pending":
+        r = call({"cmd": "pending"})
+        if out:
+            return out(r)
+        print_pending(r["pending"]) if r["pending"] else print("没有等待中的审批")
+        return 0
+
+    if a.cmd in ("approve", "deny"):
+        req = {"cmd": a.cmd, "req": a.req, "via": a.via}
+        if a.cmd == "deny":
+            req["reason"] = a.reason
+        r = call(req)
+        if out:
+            return out(r)
+        print(f"{'已批准' if r['allow'] else '已拒绝'}：{r['session']} 的 {r['tool']}")
+        return 0
+
+    if a.cmd == "answer":
+        answers = {}
+        for pair in a.pairs:
+            if "=" not in pair:
+                die(f"「{pair}」不是 问题原文=回答 的格式")
+            q, v = pair.split("=", 1)
+            answers[q.strip()] = [x.strip() for x in v.split(",")] if "," in v else v.strip()
+        r = call({"cmd": "answer", "qid": a.qid, "answers": answers, "option": a.option, "skip": a.skip,
+                  "response": a.response, "via": a.via})
+        if out:
+            return out(r)
+        print(f"{'已跳过' if r['skipped'] else '已回答'}：{r['session']}")
+        return 0
+
+    if a.cmd == "model":
+        r = call({"cmd": "model", "id": a.id, "model": a.model, "effort": a.effort})
+        if out:
+            return out(r)
+        s = r["session"]
+        print(f"{s['name']}：模型 {s['model'] or '默认'}，思考强度 {s['effort'] or '默认'}")
+        return 0
+
+    if a.cmd == "mode":
+        r = call({"cmd": "mode", "id": a.id, "mode": a.mode})
+        if out:
+            return out(r)
+        print(f"{r['session']['name']}：权限改成 {r['session']['mode']}")
+        return 0
+
+    if a.cmd == "withdraw":
+        r = call({"cmd": "withdraw", "id": a.id, "qid": a.qid})
+        if out:
+            return out(r)
+        print(f"已撤回：{r['text']}")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

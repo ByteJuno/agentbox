@@ -1,0 +1,17 @@
+[Unit]
+Description=agent-hub: Claude Code sessions on lab for Eta and the browser (HTTP on Tailscale, agentctl socket)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/ai-work/agent-hub
+ExecStart=/home/ubuntu/ai-work/agent-hub/.venv/bin/python /home/ubuntu/ai-work/agent-hub/hubd.py
+# Claude Code 和它跑的命令都继承这个 PATH
+Environment=PATH=/home/ubuntu/.npm-global/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Telegram 提醒先关着（2026-10-26），提醒以后做进 Eta
+Environment=AGENT_HUB_TG=0
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

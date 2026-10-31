@@ -34,3 +34,8 @@ __pycache__/
 
 # macOS 文件夹元数据
 .DS_Store
+
+# agent-hub
+/hub/.venv/
+__pycache__/
+/hub/ops/logs/
