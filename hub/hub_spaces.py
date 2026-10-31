@@ -22,6 +22,7 @@ import time
 import zoneinfo
 
 from aiohttp import web
+import hub_theme
 
 from hub_abx import DEFAULT_MODEL, MODEL_OPTIONS, EFFORT_LEVELS, OWNER, TIMEZONE, dumps, iso, js, now_iso
 
@@ -131,7 +132,9 @@ class Spaces:
     # ---- 停止 / 启动 / 删除 ----
 
     async def stop(self, w):
-        for s in [s for s in self.hub.sessions.values() if s.cwd == w["path"] and s.id in self.hub.active]:
+        w["stopped"] = True  # 先阻止调度，再中断，不能在等待期间又起下一条。
+        self.hub.workspaces.save()
+        for s in [s for s in self.hub.sessions.values() if s.cwd == w["path"] and s.id in self.hub.tasks]:
             try:
                 await self.hub.cmd_stop({"id": s.id, "via": "web"})
             except self.Error:
@@ -143,6 +146,8 @@ class Spaces:
     def start(self, w):
         if w.pop("stopped", None):
             self.hub.workspaces.save()
+        if hasattr(self.hub, "abx"):
+            self.hub.abx.kick_queue()
 
     # ---- 新建空间（agentbox 的创建回执流程）----
 
@@ -179,13 +184,15 @@ class Spaces:
         return c
 
     def save_creations(self):
-        if len(self.creations) > 100:
-            for rid in sorted(self.creations, key=lambda k: self.creations[k]["created_at"])[:-100]:
-                del self.creations[rid]
+        # 保留原编号，删除/放弃后的旧页面不能重放创建新的空间。
         self.store(self.creations_path, self.creations)
 
     def reserve(self, rid, spec):
-        name = (spec.get("name") or "").strip()
+        if spec.get("agent", "claude") != "claude" or spec.get("account_id", ACCOUNT_ID) != ACCOUNT_ID or spec.get("source", "empty") != "empty":
+            raise self.Error("主机版只支持已登录的 Claude Code 和空目录创建")
+        if not isinstance(spec.get("name"), str):
+            raise self.Error("名称必须是文字")
+        name = spec["name"].strip()
         if not name:
             raise self.Error("名称不能为空")
         path, display = self.target(name)
@@ -199,6 +206,7 @@ class Spaces:
             os.mkdir(path)
             created = True
         w = self.hub.workspaces.ensure(path, display)
+        w.setdefault("default_model", self.prefs().get("default_models", {}).get("claude") or DEFAULT_MODEL)
         w.pop("stopped", None)
         self.hub.workspaces.save()
         c = {"request_id": rid, "request": spec, "wid": w["id"], "created_dir": created, "state": "ready",
@@ -235,7 +243,7 @@ class Spaces:
         try:
             return datetime.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp() if (
                 "+" in v[10:] or v.endswith("Z")) else datetime.datetime.strptime(v, "%Y-%m-%dT%H:%M").replace(
-                tzinfo=zoneinfo.ZoneInfo(TIMEZONE)).timestamp()
+                tzinfo=zoneinfo.ZoneInfo(self.prefs().get("timezone", TIMEZONE))).timestamp()
         except ValueError:
             return None
 
@@ -290,7 +298,7 @@ class Spaces:
         return {"rows": page, "total": total,
                 "facets": {"users": [OWNER], "agents": ["claude"], "models": sorted({r.get("model") or "" for r in rows} - {""})},
                 "limit": limit, "offset": offset, "order": "asc" if asc else "desc", "scope": "all",
-                "timezone": TIMEZONE}
+                "timezone": self.prefs().get("timezone", TIMEZONE)}
 
     def on_hub_event(self, s, ev):
         if ev["kind"] != "usage" or not self.live:
@@ -317,12 +325,13 @@ class Spaces:
             "image_updates": {"enabled": False, "channel": "stable", "time": "04:00", "update_codex": False},
             "resources": {"max_running": 0, "max_running_per_user": 0, "min_free_bytes": 0},
             "listen": "lab", "agent_image": "（主机直跑，不用镜像）", "permission_mode": "bypassPermissions",
-            "max_upload_mb": 512, "chat_history_timeout_sec": 120, "idle_timeout_min": 0, "turn_timeout_min": 0,
-            "timezone": TIMEZONE,
+            "max_upload_mb": 512, "chat_history_timeout_sec": p.get("chat_history_timeout_sec", 120),
+            "idle_timeout_min": 0, "turn_timeout_min": 0, "max_parallel_chats": p.get("max_parallel_chats", 3),
+            "timezone": p.get("timezone", TIMEZONE),
             "container": {"memory_mb": res["memory_mb"], "cpus": res["cpus"], "pids_limit": 0, "network": "host"},
             "models": {"claude": [{**m, "reasoning": {"support": "supported", "control": "effort",
                                                       "levels": EFFORT_LEVELS}} for m in MODEL_OPTIONS]},
-            "default_models": {"claude": DEFAULT_MODEL},
+            "default_models": {"claude": p.get("default_models", {}).get("claude") or DEFAULT_MODEL},
             "terminal_tips": p.get("terminal_tips") or {"tips": [], "interval_sec": 8, "animation": "scroll"},
             "tunnel": {"enabled": False}, "tunnel_active": False, "proxy_bridge": {"bind": ""},
             "pricing": pricing, "restart_required": False,
@@ -352,8 +361,7 @@ class Spaces:
         except OSError:
             pass
         mem_used = mem.get("MemTotal", 0) - mem.get("MemAvailable", 0)
-        running = sum(1 for w in self.hub.workspaces.items.values()
-                      if any(s.cwd == w["path"] and s.id in self.hub.tasks for s in self.hub.sessions.values()))
+        running = sum(not w.get("stopped", False) for w in self.hub.workspaces.items.values())
         return {"now": int(t1 * 1000), "window_ms": int((t1 - t0) * 1000) if t0 else 0,
                 "process": {"cpu_percent": round(100 * (pcpu1 - pcpu0) / (t1 - t0), 1) if t1 > t0 else 0,
                             "rss": rss, "heap_alloc": 0, "heap_sys": 0, "goroutines": threading.active_count(),
@@ -363,8 +371,9 @@ class Spaces:
                          "disk_total": disk_total, "disk_used": disk_used,
                          "disks": [{"roles": ["data"], "total": disk_total, "used": disk_used,
                                     "available": disk_total - disk_used}]},
-                "summary": {"total": len(self.hub.workspaces.items), "running": running, "cpu_percent": cpu,
-                            "mem_usage": mem_used},
+                # 主机总量留在 host；没有容器，不把整台机器的占用冒充空间资源。
+                "summary": {"total": len(self.hub.workspaces.items), "running": running, "cpu_percent": 0,
+                            "mem_usage": 0},
                 "containers": [],
                 "storage": {"quota_at": 0, "budget_bytes": 0, "allocated_bytes": 0, "scanned_at": int(t1 * 1000),
                             "partial": False, "users": []}}
@@ -373,8 +382,15 @@ class Spaces:
 
     def themes(self):
         user = self.load(self.themes_path, {})
-        return {"format": 1, "bases": SKIN_BASES, "tokens": [], "site": [],
-                "user": [{"scope": "user", "manifest": m, "updated_at": m.get("_updated", 0)} for m in user.values()],
+        views = []
+        for m in user.values():
+            try:
+                manifest = hub_theme.validate({k: v for k, v in m.items() if k != "_updated"})
+                views.append({"scope": "user", "manifest": manifest, "updated_at": m.get("_updated", 0)})
+            except hub_theme.InvalidTheme:
+                continue
+        return {"format": 1, "bases": SKIN_BASES,
+                "tokens": [{"name": n, "kind": k} for n, k in hub_theme.TOKENS.items()], "site": [], "user": views,
                 "can_manage_site": False, "limits": {"site": 0, "user": 20, "bytes": 64 << 10}}
 
 
@@ -402,6 +418,9 @@ def register(app, api):
     async def session_delete(request):
         wid = request.match_info["id"]
         sp.ws(wid)
+        w = sp.ws(wid)
+        if any(s.id in hub.tasks for s in hub.abx.threads_of(w)):
+            raise Error("这个空间还有对话在跑，先停掉", status=409)
         hub.workspaces.remove(wid)
         await hub.terminals.kill(wid)
         return js({"ok": True})
@@ -417,10 +436,18 @@ def register(app, api):
         return js(sp.view(w))
 
     async def session_create(request):
-        raise Error("请刷新页面后用「新建工作空间」创建")
+        import secrets
+        c = sp.reserve(secrets.token_hex(16), await body(request))
+        c["state"] = "complete"
+        sp.save_creations()
+        return js(sp.view(sp.ws(c["wid"])), status=201)
 
     async def switch_account(request):
-        raise Error("lab 上只有一个账号：已登录的 Claude Code")
+        w = sp.ws(request.match_info["id"])
+        b = await body(request)
+        if b.get("account_id") != ACCOUNT_ID:
+            raise Error("lab 上只有一个账号：已登录的 Claude Code")
+        return js(sp.view(w))
 
     # ---- 新建空间 ----
 
@@ -439,20 +466,42 @@ def register(app, api):
         async with sp.lock:
             c = sp.creations.get(rid)
             if c:
-                if c["request"].get("name") != spec.get("name"):
+                if c["state"] == "abandoned" or c.get("wid") not in hub.workspaces.items:
+                    from hub_abx import problem
+                    return problem(410, "creation_gone", "该创建已放弃或空间已删除")
+                if c["request"] != spec:
                     raise Error("这个创建编号已经用来建过别的空间", status=409)
             else:
                 c = sp.reserve(rid, spec)
         return js(sp.creation_view(c))
 
     async def creation_action(request):
-        c = sp.creation(request.match_info["request"])
         b = await body(request)
+        rid = request.match_info["request"]
+        if not CREATION_ID.fullmatch(rid):
+            raise Error("创建编号不对")
         action = b.get("action")
+        c = sp.creations.get(rid)
+        if c is None and action == "abandon":
+            c = {"request_id": rid, "request": {}, "wid": "", "state": "abandoned", "created_at": now_iso()}
+            sp.creations[rid] = c
+            sp.save_creations()
+            return js({"ok": True})
+        c = sp.creation(rid)
+        if c["state"] == "abandoned":
+            if action == "abandon":
+                return js({"ok": True})
+            from hub_abx import problem
+            return problem(410, "creation_gone", "该创建已经放弃")
         if action == "finish":
+            if c.get("wid") not in hub.workspaces.items:
+                from hub_abx import problem
+                return problem(410, "creation_gone", "该空间已经删除")
             c["state"] = "complete"
         elif action == "abandon":
             w = hub.workspaces.items.get(c.get("wid") or "")
+            if w and any(s.id in hub.tasks for s in hub.abx.threads_of(w)):
+                raise Error("这个空间还有对话在跑，先停掉", status=409)
             if w and c.get("created_dir") and os.path.isdir(w["path"]) and not any(os.scandir(w["path"])):
                 os.rmdir(w["path"])   # 只删自己刚建的空目录
                 hub.workspaces.remove(w["id"])
@@ -479,7 +528,7 @@ def register(app, api):
                    "has_workspaces": bool(hub.workspaces.items),
                    "accounts": [{"id": ACCOUNT_ID, "type": "claude", "label": ACCOUNT_LABEL,
                                  "credentials_present": True, "default_model": DEFAULT_MODEL}],
-                   "default_models": {"claude": DEFAULT_MODEL}, "container_resources": sp.resources()})
+            "default_models": sp.settings()["default_models"], "container_resources": sp.resources()})
 
     async def account_usage(request):
         """订阅额度：拿 lab 上 Claude Code 自己的 OAuth 令牌查 /api/oauth/usage（只读，不续期；续期是 CLI 的事）。"""
@@ -560,16 +609,49 @@ def register(app, api):
     async def settings_put(request):
         b = await body(request)
         p = sp.prefs()
-        if isinstance(b.get("terminal_tips"), dict):
-            p["terminal_tips"] = b["terminal_tips"]
+        # 历史超时与这三个字段属于上游同一保存组，接受原值回传，不假装支持修改。
+        fixed = {k: sp.settings()[k] for k in ("permission_mode", "max_upload_mb", "listen")}
+        if any(k in b and (type(b[k]) is not type(v) or b[k] != v) for k, v in fixed.items()):
+            raise Error("主机版不支持修改权限模式、上传上限或监听地址")
+        if "timezone" in b:
+            try:
+                if not isinstance(b["timezone"], str):
+                    raise ValueError
+                zoneinfo.ZoneInfo(b["timezone"])
+            except (ValueError, zoneinfo.ZoneInfoNotFoundError):
+                raise Error("时区无效")
+            p["timezone"] = b["timezone"]
+        if "terminal_tips" in b:
+            tips = b["terminal_tips"]
+            if not isinstance(tips, dict) or not isinstance(tips.get("tips"), list) or len(tips["tips"]) > 50 or not all(
+                    isinstance(t, str) and len(t) <= 1000 for t in tips["tips"]) or type(tips.get("interval_sec")) is not int or not 0 <= tips["interval_sec"] <= 3600 or tips.get("animation", "scroll") != "scroll":
+                raise Error("终端提示格式不对")
+            p["terminal_tips"] = {"tips": tips["tips"], "interval_sec": tips["interval_sec"], "animation": "scroll"}
+        for key, low, high in (("max_parallel_chats", 1, 10), ("chat_history_timeout_sec", 1, 3600)):
+            if key in b:
+                value = b[key]
+                if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+                    raise Error(f"{key} 必须在 {low}–{high} 之间")
+                p[key] = value
+        if "default_models" in b:
+            models = b["default_models"]
+            if not isinstance(models, dict) or set(models) - {"claude"} or not isinstance(models.get("claude"), str) or not hub.valid_model(models["claude"]):
+                raise Error("默认模型无效")
+            p["default_models"] = {"claude": models.get("claude") or DEFAULT_MODEL}
+        if set(b) - {"terminal_tips", "max_parallel_chats", "chat_history_timeout_sec", "default_models", "timezone", *fixed}:
+            raise Error("主机版不支持这项设置")
         sp.store(sp.prefs_path, p)
+        if "max_parallel_chats" in b:
+            for wid in hub.abx.rooms:
+                hub.abx.broadcast(wid, {"type": "chat_limit", "max_parallel": p["max_parallel_chats"]})
+            hub.abx.kick_queue()
         return js(sp.settings())
 
     async def system(request):
         return js({"version": "agent-hub", "revision": "", "built_at": "", "go_version": "Python",
                    "data_dir": sp.state_dir, "config_path": sp.state_dir, "docker_version": "",
                    "sessions_total": len(hub.workspaces.items),
-                   "sessions_running": sum(1 for _ in hub.tasks), "accounts": 1, "users": 1,
+                   "sessions_running": sum(not w.get("stopped", False) for w in hub.workspaces.items.values()), "accounts": 1, "users": 1,
                    "started_at": int(sp.started * 1000), "listen": "lab"})
 
     async def monitor(request):
@@ -585,7 +667,11 @@ def register(app, api):
         return js({"proxies": [], "revision": 0})
 
     async def pricing(request):
-        return js({"pricing": sp.settings()["pricing"], "revision": "", "catalog": None})
+        return js({"active": {"prices": sp.settings()["pricing"], "revision": "hub", "managed": {},
+                              "catalog": {"url": "", "auto_check": False, "auto_apply": False}, "history": []},
+                   "candidate": {"catalog": {"schema": 1, "version": "", "published_at": "", "entries": {}},
+                                 "revision": "", "url": "", "bundled": False, "checked_at": 0, "attempted_at": 0, "error": ""},
+                   "changes": [], "warnings": [], "warnings_truncated": False})
 
     async def image_updates(request):
         return js({"enabled": False, "supported": False, "reason": "lab 上没有 Agent 镜像，Claude Code 直接装在主机上"})
@@ -600,22 +686,29 @@ def register(app, api):
 
     async def theme_validate(request):
         b = await body(request)
-        return js({"ok": True, "manifest": b.get("manifest") or b})
+        try:
+            manifest = hub_theme.validate(b)
+        except hub_theme.InvalidTheme as e:
+            return js({"error": str(e), "theme_error": e.problem}, status=400)
+        return js({"manifest": manifest})
 
     async def theme_put(request):
         tid = request.match_info["tid"]
         if not THEME_ID.match(tid):
             raise Error("主题 ID 不对")
         b = await body(request)
-        m = b.get("manifest") or b
-        if not isinstance(m, dict) or m.get("base") not in SKIN_BASES:
-            raise Error("主题格式不对")
+        try:
+            m = hub_theme.validate(b)
+        except hub_theme.InvalidTheme as e:
+            return js({"error": str(e), "theme_error": e.problem}, status=400)
+        if m["id"] != tid:
+            raise Error("主题 ID 与路径不一致")
         user = sp.load(sp.themes_path, {})
         if tid not in user and len(user) >= 20:
             raise Error("主题太多了，先删几个")
         user[tid] = {**m, "id": tid, "_updated": int(time.time() * 1000)}
         sp.store(sp.themes_path, user)
-        return js(sp.themes())
+        return js({"scope": "user", "manifest": m, "updated_at": user[tid]["_updated"]})
 
     async def theme_delete(request):
         user = sp.load(sp.themes_path, {})
@@ -726,4 +819,6 @@ def register(app, api):
     r.add_route("*", "/api/sessions/{id}/browser", browser)
     r.add_get("/api/extensions", extensions)
     r.add_get("/api/sessions/{id}/delegation/options", delegation_options)
-    r.add_get("/api/delegation/stats", empty_list)
+    async def delegation_stats(request):
+        return js({"stats": []})
+    r.add_get("/api/delegation/stats", delegation_stats)

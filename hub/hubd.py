@@ -61,6 +61,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     PermissionResultAllow,
     PermissionResultDeny,
+    ProcessError,
     ResultMessage,
     StreamEvent,
     SystemMessage,
@@ -77,6 +78,7 @@ from claude_agent_sdk._internal.message_parser import parse_message
 import hub_abx
 import hub_files
 import hub_git
+import hub_optional
 import hub_skills
 import hub_spaces
 import hub_term
@@ -361,6 +363,7 @@ class Turn:
     steers: dict = field(default_factory=dict)        # 插话 uuid → (request_id, 状态)
     req: dict = field(default_factory=dict)           # parent_tool_use_id → 正在进行的模型请求
     thinking_emitted: float = 0.0
+    user_interrupted: bool = False
 
     def steers_pending(self):
         return any(state != "applied" for _, state in self.steers.values())
@@ -629,6 +632,9 @@ def write_json(path, data):
 
 
 class Hub:
+    valid_model = staticmethod(valid_model)
+    slim_event = staticmethod(slim_event)
+
     def __init__(self):
         self.sessions: dict[str, Session] = {}
         self.logs: dict[str, EventLog] = {}
@@ -807,8 +813,8 @@ class Hub:
 
     # ---- 跑一轮、排队 ----
 
-    def start_turn(self, s, prompt, quiet, qid=None):
-        tid = secrets.token_hex(6)
+    def start_turn(self, s, prompt, quiet, qid=None, turn_id=None):
+        tid = turn_id or secrets.token_hex(6)
         self.emit(s, "user", text=prompt, qid=qid,
                   turn={"id": tid, "model": s.model or s.actual_model, "effort": s.effort, "control": "effort"})
         self.touch(s, status="running", last_prompt=prompt, last_error="", queue_paused=False)
@@ -822,14 +828,20 @@ class Hub:
             self.changed.pop(s.id, asyncio.Event()).set()   # agentctl wait 看的是任务还在不在，这里再叫醒一次
         if not self.stopping and not s.queue_paused:
             self.run_next(s)
+        if hasattr(self, "abx"):
+            self.abx.kick_queue()
 
     def run_next(self, s):
         if s.id in self.tasks or not s.queue:
             return
+        if hasattr(self, "abx"):
+            w = self.workspaces.by_path(s.cwd)
+            if w and (w.get("stopped") or self.abx.blocked(w["id"], s.id)):
+                return
         item = s.queue.pop(0)
         self.save()
         self.emit(s, "dequeued", qid=item["qid"])
-        self.start_turn(s, item["text"], item.get("quiet", False), qid=item["qid"])
+        self.start_turn(s, item["text"], item.get("quiet", False), qid=item["qid"], turn_id=item.get("turn_id"))
 
     def turn_options(self, s):
         """本轮起 Claude Code 用的参数（拆出来便于单测：不连模型也能查参数）。"""
@@ -857,16 +869,17 @@ class Hub:
         )
 
     async def run_turn(self, s, prompt, quiet, turn_id=""):
-        if not s.started and await asyncio.to_thread(get_session_info, s.id, directory=s.cwd):
-            # 上一轮 Claude Code 已经建好会话，hub 却在收到 init 前退出了：再按 session_id 新建会报「已在使用」
-            self.touch(s, started=True)
-        opts = self.turn_options(s)
-        client = ClaudeSDKClient(opts)
         turn = Turn(sent_at=time.time(), id=turn_id)
-        self.active[s.id] = client
         self.turns[s.id] = turn
+        client = None
+        exit_failed = False
         t0 = time.time()
         try:
+            if not s.started and await asyncio.to_thread(get_session_info, s.id, directory=s.cwd):
+                # 上次已建好 CLI 会话但还没收到 init：沿用原 ID 续聊。
+                self.touch(s, started=True)
+            client = ClaudeSDKClient(self.turn_options(s))
+            self.active[s.id] = client
             await client.connect()
             if not s.command_info:
                 try:
@@ -881,10 +894,10 @@ class Hub:
             if turn.result is not None:
                 await self.capture_context(s, client)
         except asyncio.CancelledError:
-            self.touch(s, status="interrupted", last_error="agent-hub 停止，这一轮没做完")
-            raise
+            self.touch(s, status="interrupted", last_error="" if turn.user_interrupted else "agent-hub 停止，这一轮没做完")
         except Exception as e:
             traceback.print_exc()
+            exit_failed = isinstance(e, ProcessError) and e.exit_code not in (None, 0)
             self.touch(s, status="error", last_error=clip(f"{type(e).__name__}: {e}", 800))
         finally:
             self.active.pop(s.id, None)
@@ -896,7 +909,8 @@ class Hub:
                 if state != "applied":   # 回合在插话生效前就结束了：告诉页面，让机主决定要不要再发
                     self.emit(s, "steer", qid=rid, state="dropped")
             try:
-                await client.disconnect()
+                if client is not None:
+                    await client.disconnect()
             except Exception:
                 traceback.print_exc()
 
@@ -919,9 +933,13 @@ class Hub:
         elif s.status in ACTIVE_STATES:   # 没有结果也没有异常：Claude Code 进程中途退出
             self.touch(s, status="error", last_error="Claude Code 没给结果就退出了")
         secs = time.time() - t0
+        if turn.user_interrupted:
+            self.touch(s, status="interrupted", last_error="")
+        uncertain = "" if turn.user_interrupted else "server_shutdown" if self.stopping else (
+            "" if result is not None or exit_failed else "execution_incomplete")
         self.emit(s, "result", status=s.status, text=clip(s.last_result, 4000), error=s.last_error,
                   cost=s.last_cost if result else None, steps=result.num_turns if result else 0,
-                  secs=round(secs, 1))
+                  secs=round(secs, 1), **({"error_code": uncertain} if uncertain else {}))
         if not quiet and not self.log_of(s.id).subs:   # 有人开着这个会话在看，就不再推 Telegram
             await self.notify_result(s, result, secs)
 
@@ -1013,14 +1031,15 @@ class Hub:
 
     def forward_raw(self, s, t, data):
         """原样转发 Claude Code 的事件给网页（agentbox 的渲染模块吃这个格式）：完整事件落盘，逐字增量只推。"""
-        if t in ("rate_limit_event", "command_lifecycle") or (
+        if t == "command_lifecycle" or (
                 t == "system" and data.get("subtype") == "thinking_tokens") or (
                 t == "user" and data.get("isReplay")):
             return
         if t == "stream_event":
             self.emit(s, "agent_event", persist=False, event=data)
         else:
-            self.emit(s, "agent_event", event=slim_event(data))
+            stopped = t == "result" and getattr(self.turns.get(s.id), "user_interrupted", False)
+            self.emit(s, "agent_event", event=slim_event(data), **({"state": "interrupted"} if stopped else {}))
 
     def on_stream_event(self, s, turn, ev, parent):
         kind = ev.get("type")
@@ -1135,9 +1154,13 @@ class Hub:
             return False
         uid = str(uuid.UUID(hashlib.md5(rid.encode()).hexdigest()))
         turn.steers[uid] = (rid, "sent")
-        await client._transport.write(json.dumps({
-            "type": "user", "message": {"role": "user", "content": text}, "parent_tool_use_id": None,
-            "session_id": "default", "priority": "next", "uuid": uid}) + "\n")
+        try:
+            await client._transport.write(json.dumps({
+                "type": "user", "message": {"role": "user", "content": text}, "parent_tool_use_id": None,
+                "session_id": "default", "priority": "next", "uuid": uid}) + "\n")
+        except BaseException:
+            turn.steers.pop(uid, None)
+            raise
         self.emit(s, "steer", qid=rid, text=text, state="sent")
         return True
 
@@ -1372,7 +1395,7 @@ class Hub:
         self.sessions[sid] = s
         self.workspaces.ensure(cwd)
         self.remember(req.get("request_id"), sid, dig)
-        self.start_turn(s, prompt, bool(req.get("quiet")), qid=req.get("request_id"))
+        self.start_turn(s, prompt, bool(req.get("quiet")), qid=req.get("request_id"), turn_id=req.get("_turn_id"))
         return {"session": self.view(s)}
 
     async def cmd_adopt(self, req):
@@ -1440,7 +1463,8 @@ class Hub:
         if s.id in self.tasks or s.queue:
             # 正在跑（或者停止后队列还没跑完）：排到队尾，不插队
             qid = rid or secrets.token_hex(8)
-            s.queue.append({"qid": qid, "text": prompt, "quiet": quiet, "created": time.time()})
+            s.queue.append({"qid": qid, "text": prompt, "quiet": quiet, "created": time.time(),
+                            **({"turn_id": req["_turn_id"]} if req.get("_turn_id") else {})})
             s.queue_paused = s.queue_paused and s.id in self.tasks
             self.save()
             self.emit(s, "queued", qid=qid, text=prompt)
@@ -1448,7 +1472,7 @@ class Hub:
             self.run_next(s)
             return {"session": self.view(s), "queued": qid}
         self.remember(rid, s.id, dig)
-        self.start_turn(s, prompt, quiet, qid=rid)
+        self.start_turn(s, prompt, quiet, qid=rid, turn_id=req.get("_turn_id"))
         return {"session": self.view(s)}
 
     async def cmd_withdraw(self, req):
@@ -1516,8 +1540,12 @@ class Hub:
     async def cmd_stop(self, req):
         s = self.resolve(req.get("id"))
         client = self.active.get(s.id)
-        if not client:
+        task = self.tasks.get(s.id)
+        if not task or task.done():
             raise HubError(f"「{s.name}」现在没在跑", status=409)
+        turn = self.turns.get(s.id)
+        if turn:
+            turn.user_interrupted = True
         via = req.get("via") or "agentctl"
         for w in self.waiters_of(s):
             if not w.future.done():
@@ -1525,17 +1553,22 @@ class Hub:
                 self.emit(s, f"{w.kind}_resolved", **{"req" if w.kind == "approval" else "qid": w.id},
                           allow=False, state="cancelled", via=via, reason="停止")
                 await self.tg_edit(w, "⏹ 已停止")
-        if s.queue:   # 机主喊停多半是要插手：后面排队的先别自动跑，下次发消息时接着跑
-            self.touch(s, queue_paused=True)
-        await client.interrupt()
-        asyncio.create_task(self.force_stop(s.id, 20))
+        self.touch(s, queue_paused=True)
+        if client:
+            await client.interrupt()
+            asyncio.create_task(self.force_stop(s.id, 20, task))
+        else:
+            task.cancel()
+            if turn is None:  # 协程还没开始，取消不会进入 run_turn 的 finally。
+                self.touch(s, status="interrupted", last_error="")
+                self.emit(s, "result", status="interrupted", error="", cost=None, secs=0)
         return {"session": self.view(s)}
 
-    async def force_stop(self, sid, grace):
+    async def force_stop(self, sid, grace, expected_task):
         # interrupt 一般几秒内就会收到 ResultMessage；卡住的话取消任务，disconnect 会结束 Claude 进程
         await asyncio.sleep(grace)
         task = self.tasks.get(sid)
-        if task and not task.done():
+        if task is expected_task and not task.done():
             task.cancel()
 
     async def cmd_dirs(self, req):
@@ -1642,12 +1675,18 @@ def http_app(hub, token):
             if request.path.startswith(("/api/", "/hub/")) and request.path not in PUBLIC_PATHS:
                 if not authorized(request):
                     raise HubError("unauthorized", status=401)
-                if request.method not in ("GET", "HEAD") and "Authorization" not in request.headers \
+                if request.method not in ("GET", "HEAD") and not secrets.compare_digest(
+                        request.headers.get("Authorization", ""), f"Bearer {token}") \
                         and not same_origin(request):
                     # 只靠 cookie 的写请求必须来自本站页面（SameSite=Strict 之外再挡一层 CSRF）
                     raise HubError("跨站请求被拒绝", status=403)
+                if request.headers.get("Upgrade", "").lower() == "websocket" and not same_origin(request):
+                    raise HubError("跨站连接被拒绝", status=403)
             return await handler(request)
         except HubError as e:
+            if request.path.startswith("/api/"):
+                code = "authentication_required" if e.status == 401 else "session_not_found" if e.status == 404 else "invalid_request"
+                return hub_abx.problem(e.status, code, str(e))
             return web.json_response({"ok": False, "error": str(e)}, status=e.status,
                                      dumps=lambda o: json.dumps(o, ensure_ascii=False))
         except OSError as e:   # 文件页之类直接碰磁盘的接口：把系统错误变成页面看得懂的一句话
@@ -1678,7 +1717,7 @@ def http_app(hub, token):
         return ok({"token": token if good and same_origin(request) else ""})
 
     async def index(request):
-        # 网页端就是 agentbox 的前端（web/abx，Apache-2.0），接口由 hub_abx 按它的格式提供
+        # 网页端就是 agentbox 的原版前端（ABX_DIR，Apache-2.0），接口由 hub_abx 按它的格式提供
         with open(os.path.join(ABX_DIR, "index.html")) as f:
             page = f.read().replace("{{BUILD}}", BUILD)
         # 原版前端一个字不改；只在这里注入 hub 自己的一小段样式和脚本（藏起单人版用不上的入口）
@@ -1772,7 +1811,7 @@ def http_app(hub, token):
     async def dirs(request):
         return ok(await hub.cmd_dirs({"path": request.query.get("path")}))
 
-    app = web.Application(middlewares=[guard])
+    app = web.Application(middlewares=[guard], client_max_size=4 << 20)
     r = app.router
     r.add_get("/", index)
     r.add_get("/_v/{build}/{tail:.+}", versioned)
@@ -1798,7 +1837,7 @@ def http_app(hub, token):
     r.add_get("/hub/stream", stream_all)
     r.add_get("/hub/dirs", dirs)
     api = types.SimpleNamespace(hub=hub, ok=ok, body=body, via=via, Error=HubError, token=token)
-    for mod in (hub_workspaces, hub_files, hub_git, hub_skills, hub_term, hub_abx, hub_spaces):   # 各功能模块自己挂路由
+    for mod in (hub_workspaces, hub_files, hub_git, hub_skills, hub_term, hub_abx, hub_spaces, hub_optional):   # 各功能模块自己挂路由
         mod.register(app, api)
     return app
 

@@ -167,6 +167,8 @@ class Workspaces:
         sessions = [s for s in self.hub.sessions.values() if s.cwd == w["path"]]
         if any(s.id in self.hub.tasks for s in sessions):
             raise self.Error("这个空间还有对话在跑，先停掉", status=409)
+        if hasattr(self.hub, "abx"):
+            self.hub.abx.delete_receipts(wid)
         for s in sessions:   # 只从 hub 里移除；Claude Code 自己的会话记录还在，以后还能再接手
             self.hub.sessions.pop(s.id, None)
             try:

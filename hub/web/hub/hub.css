@@ -29,3 +29,7 @@ label:has(#new-git-connection) + .field-hint,
 #btn-changes-clone,
 button[data-git-sec="connections"],
 #btn-git-management { display: none !important; }
+/* 新前端增加的独立项目终端尚未接入；主终端仍使用原来的 tmux 会话。
+   账号池只读，不能展示会报错的新增/认证/编辑入口。 */
+#term-new, #btn-acct-add, .acct-actions, .acct-models-link,
+#set-keepalive, #btn-change-password { display: none !important; }

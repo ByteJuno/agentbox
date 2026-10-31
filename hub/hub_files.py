@@ -8,7 +8,8 @@
   页面上显示成 /shared/…；发给 Claude 之前换成真实路径（hub_abx 里做），Claude 才读得到。
 
 agentbox 的文件区是容器写的，所以它处处防符号链接；这里文件本来就是你自己的（网页上还有终端），
-只挡请求里的路径跳出范围（.. 和绝对路径），目录里的符号链接照常跟随。
+拒绝路径跳出范围（含 ..、绝对路径和指向范围外的链接），范围内的符号链接照常跟随。
+预览通行证还要再次按获准的单个目录检查，不能借项目里的链接读到其他目录。
 """
 import asyncio
 import datetime
@@ -182,7 +183,25 @@ class Files:
             if not allow_root:
                 raise self.Error("不能对根目录这样操作")
             return root
-        return os.path.join(root, norm)
+        target = os.path.join(root, norm)
+        # 预览授权仅限这一个目录；普通文件接口也不能通过链接跳到范围外。
+        real_root, real_target = os.path.realpath(root), os.path.realpath(target)
+        if real_target != real_root and not real_target.startswith(real_root + os.sep):
+            raise self.Error("路径不能跳出当前范围", status=403)
+        return target
+
+    def valid_attachment(self, path):
+        if not isinstance(path, str) or not ATTACH_PATH.fullmatch(path):
+            return False
+        target = self.shared
+        try:
+            for component in path[len("/shared/"):].split("/"):
+                target = os.path.join(target, component)
+                if stat.S_ISLNK(os.lstat(target).st_mode):
+                    return False
+            return stat.S_ISREG(os.lstat(target).st_mode)
+        except OSError:
+            return False
 
     @staticmethod
     def rel_of(root, path):
@@ -650,8 +669,8 @@ def register(app, api):
         if not isinstance(paths, list) or len(paths) > 64 or not all(isinstance(p, str) and ATTACH_PATH.match(p)
                                                                        for p in paths):
             return js({"code": "invalid_request", "error": "附件路径不对"}, status=400)
-        return web.json_response({"valid": [os.path.isfile(os.path.join(fs.shared, p[len("/shared/"):]))
-                                            for p in paths]}, headers={"Cache-Control": "no-store"})
+        return web.json_response({"valid": [fs.valid_attachment(p) for p in paths]},
+                                 headers={"Cache-Control": "no-store"})
 
     async def search(request):
         w = hub.workspaces.get(request.match_info["id"])

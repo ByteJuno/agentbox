@@ -180,11 +180,14 @@ class Terminals:
                         except ValueError:
                             continue
                         if isinstance(ctl, dict) and ctl.get("type") == "resize":
-                            cols, rows = int(ctl.get("cols") or 0), int(ctl.get("rows") or 0)
+                            cols, rows = ctl.get("cols"), ctl.get("rows")
+                            if type(cols) is not int or type(rows) is not int:
+                                continue
                             if 0 < cols <= 1000 and 0 < rows <= 1000:
                                 set_size(master, rows, cols)
             finally:
                 send_task.cancel()
+                await asyncio.gather(send_task, return_exceptions=True)
         finally:
             self.open.discard(wsr)
             if master is not None:
@@ -209,6 +212,7 @@ def register(app, api):
 
     async def term(request):
         w = hub.workspaces.get(request.match_info["id"])
+        hub.spaces.start(w)
         return await terms.handle(request, w)
 
     async def on_shutdown(app):

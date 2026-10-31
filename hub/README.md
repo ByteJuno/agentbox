@@ -4,8 +4,9 @@
 在哪个端都能接着聊。Agent 直接跑在 lab 主机上（不进容器），用的就是 lab 上已经登录的 Claude Code，
 模型、设置、CLAUDE.md、技能和记忆都一样。
 
-网页端直接用 [agentbox](https://github.com/devilcoolyue/agentbox)（Apache-2.0）的原版前端，文件在
-`web/abx/`（来源和版本见 `web/abx/UPSTREAM`，许可见 `web/abx/LICENSE`、`NOTICE`），一个字没改；hub 按它的
+代码在 [ByteJuno/agentbox](https://github.com/ByteJuno/agentbox) 的 `hub` 分支（fork 自
+[agentbox](https://github.com/devilcoolyue/agentbox)，Apache-2.0）。网页端直接用仓库里上游的原版前端
+`internal/web/static`（跟上游合并就是升级前端），一个字没改；hub 按它的
 接口格式提供后端。服务首页时只注入 `web/hub/` 下的一小段样式和脚本：藏起单人版用不上的入口（远程浏览器、
 内网隧道、扩展、设置里的团队和容器分区），说明新建空间时名称怎么对应目录，以及旧 cookie 自动登录。
 
@@ -16,6 +17,8 @@
 | `hubd.py` | 守护进程：Claude Agent SDK 跑会话、排队、插话、审批、提问；HTTP + SSE + WebSocket；Unix socket 给 agentctl |
 | `hub_abx.py` | agentbox 的对话接口：线程、历史（分页）、实时对话、消息回执（排队 / 插话 / 撤回 / 中断）、提问作答、任务面板 |
 | `hub_spaces.py` | 空间列表与新建 / 改名 / 删除 / 停止、账号、使用记录、设置、资源监控、主题等外壳接口 |
+| `hub_optional.py` | 未启用功能的空列表 / 关闭状态与明确拒绝；不调用模型的环境诊断 |
+| `hub_theme.py` | 个人主题清单、令牌白名单与安全 CSS 取值校验 |
 | `hub_files.py` | 文件页、聊天附件、HTML 预览直链、@ 文件搜索 |
 | `hub_git.py` | 变更页：状态、diff、提交、丢弃 |
 | `hub_term.py` + `tmux.conf` | 网页终端：每个空间一个 tmux 会话 |
@@ -95,7 +98,25 @@ agentctl token        # 网页登录和 Eta 用的令牌，只在自己终端里
 - 每轮起一个 Claude Code 进程；后台任务（`run_in_background`）会让这一轮等到它结束。
 - 子 Agent 内部的步骤不展开，只显示那一次 Agent 调用和结果。
 - 费用按 API 价目估算，订阅账号实际不按这个扣。
+- 网页「同时运行的对话数」按空间限制（默认 3，可设 1–10）；原生 `/hub` / agentctl 保留自己的准入方式。
+- 网页历史以 hub 追加事件为准。hub 开始原样存 Claude 事件（10-27 下午）之前的那段、以及接手前的终端记录，首次读取时从 Claude 转录冻结到 `events/<会话>.jsonl.history2.json`（跨压缩读全，旧段截图不留、工具输出截到 2000 字），CLI 后续压缩不会重排网页游标。删掉这个文件会按当时的转录重建一次。
 - Windows 上可以跑（只开 HTTP，没有 agentctl 和终端），还没实测。
+
+## 开发验证
+
+不调用 Claude、全部状态写临时目录的 HTTP / WebSocket / PTY / 本地 Git 回归：
+
+```sh
+AGENT_HUB_TG=0 AGENT_HUB_MAX_TURNS=30 .venv/bin/python -m unittest discover -s hub/tests -v
+```
+
+可选浏览器回归（需要 Python Playwright 和 Chromium）：
+
+```sh
+AGENT_HUB_TG=0 .venv/bin/python hub/tests/browser_compat.py
+```
+
+浏览器回归运行原版网页与合成 CLI，覆盖发送、回合中刷新、工具行、文件 / Git / 技能页、设置保存、监控和窄屏；不代表真实 Claude 或真实 tmux 链路验收。协议差异与剩余验收见 [REVIEW-codex.md](docs/REVIEW-codex.md)。
 
 ## 额度消耗与自动压缩窗口（2026-10-30）
 

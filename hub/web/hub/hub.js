@@ -12,6 +12,27 @@
       desc.removeAttribute("data-i18n-text");
       desc.textContent = "空间就是 lab 上的一个项目目录：已有的直接打开，没有的在 ~/ai-work 下新建。Claude 直接在 lab 上运行。";
     }
+    // 这两项与 Docker 无关：把原控件移到可见的界面分区，保留上游的保存/校验监听。
+    var section = document.getElementById("sec-interface");
+    var parallel = document.getElementById("set-max-parallel");
+    if (section && parallel) {
+      var card = parallel.closest(".card");
+      if (card && card.parentNode !== section) {
+        var explanation = card.querySelector(".card-desc");
+        if (explanation) {
+          explanation.removeAttribute("data-i18n");
+          explanation.textContent = "一个工作空间里最多几个对话线程可以同时运行。每个线程直接使用主机上的 Claude Code；超过上限的跟进消息等待空位。";
+        }
+        section.appendChild(card);
+      }
+    }
+    var history = document.getElementById("set-history-timeout");
+    if (section && history && !section.contains(history)) {
+      var historyCard = document.createElement("div");
+      historyCard.className = "card";
+      historyCard.appendChild(history.closest(".field"));
+      section.appendChild(historyCard);
+    }
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", apply);
   else apply();
