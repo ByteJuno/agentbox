@@ -169,7 +169,8 @@ type Server struct {
 
 	marketMu sync.Mutex // 串行化官方市场的 git 抓取（拉仓库、装技能）
 
-	logins *loginGuard // per-IP failed-login throttle
+	logins   *loginGuard  // per-IP failed-login throttle
+	activity activityGate // per-user write throttle for activity reports
 
 	mon *monState // 上一帧计数器快照，供监控页按轮询间隔算 CPU 速率
 
@@ -333,6 +334,10 @@ func sameHostOrigin(r *http.Request) bool {
 }
 
 func (s *Server) Handler() http.Handler {
+	return operationHandler(s.admit(s.routes()))
+}
+
+func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /api/login", s.handleLogin)
@@ -381,6 +386,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/session-creations/{request}/upload", s.auth(http.HandlerFunc(s.handleProjectUpload)))
 	mux.Handle("POST /api/session-creations/{request}/git", s.auth(http.HandlerFunc(s.handleProjectGit)))
 	mux.Handle("POST /api/me/password", s.auth(http.HandlerFunc(s.handleChangePassword)))
+	mux.Handle("POST /api/me/activity", s.auth(http.HandlerFunc(s.handleActivityReport)))
 	mux.Handle("GET /api/me/git", s.auth(http.HandlerFunc(s.handleGitProfile)))
 	mux.Handle("GET /api/git/connections", s.auth(http.HandlerFunc(s.handleGitConnections)))
 	mux.Handle("GET /api/git/connections/{connection}/shares", s.admin(http.HandlerFunc(s.handleGitShares)))
@@ -405,6 +411,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("PUT /api/sessions/{id}/git/bindings", s.auth(s.withSession(s.handleGitBindings)))
 	mux.Handle("PUT /api/me/git", s.auth(http.HandlerFunc(s.handleGitProfile)))
 	mux.Handle("GET /api/users", s.admin(http.HandlerFunc(s.handleUserList)))
+	mux.Handle("GET /api/user-activity", s.admin(http.HandlerFunc(s.handleUserActivity)))
+	mux.Handle("GET /api/login-events", s.admin(http.HandlerFunc(s.handleLoginEvents)))
 	mux.Handle("POST /api/users", s.admin(http.HandlerFunc(s.handleUserCreate)))
 	mux.Handle("DELETE /api/users/{name}", s.admin(http.HandlerFunc(s.handleUserDelete)))
 	mux.Handle("POST /api/users/{name}/password", s.admin(http.HandlerFunc(s.handleUserSetPassword)))
@@ -414,6 +422,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/users/{name}/credits", s.admin(http.HandlerFunc(s.handleCreditGrant)))
 	mux.Handle("GET /api/usage", s.auth(http.HandlerFunc(s.handleUsageReport)))
 	mux.Handle("GET /api/usage/events", s.auth(http.HandlerFunc(s.handleUsageEvents)))
+	mux.Handle("GET /api/usage/trend", s.auth(http.HandlerFunc(s.handleUsageTrend)))
 	mux.Handle("GET /api/usage/live", s.auth(http.HandlerFunc(s.handleUsageLive)))
 	mux.Handle("GET /api/accounts", s.auth(http.HandlerFunc(s.handleAccounts)))
 	mux.Handle("POST /api/accounts", s.admin(http.HandlerFunc(s.handleAccountCreate)))
@@ -568,7 +577,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.Handle("/", staticHandler())
 
-	return operationHandler(s.admit(mux))
+	return mux
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -777,7 +786,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		scope = importFingerprint([]string{"chat-drafts-v1", instance, u.Name, u.CreatedAt.UTC().Format(time.RFC3339Nano)})
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, map[string]any{
+	me := map[string]any{
 		"draft_scope":         scope,
 		"draft_protocol":      1,
 		"chat_protocol":       1,
@@ -801,7 +810,14 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		"chat_history_timeout_sec": s.cfg.GetChatHistoryTimeoutSec(),
 		// 自己的额度：metered 为 false 就是不限额，前端不必显示余额。
 		"quota": viewQuota(u.Name, q, metered),
-	})
+	}
+	// Only an admin can act on this, and disk levels are not for ordinary users.
+	if u.Role == store.RoleAdmin {
+		if low := s.lowStorageDisks(); len(low) > 0 {
+			me["storage_low"] = map[string]any{"disks": low, "reserve_bytes": s.cfg.GetResources().MinFreeBytes}
+		}
+	}
+	writeJSON(w, http.StatusOK, me)
 }
 
 // handlePing answers a tiny, unauthenticated request the client uses to gauge

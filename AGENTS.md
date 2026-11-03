@@ -208,7 +208,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' --connect-timeout 10 --max-time 20 "$P
 
 - 创建：`POST /api/sessions` 在 `data/users/<user>/sessions/<id>/` 下创建 `workspace` 与 `home`，并 `chown` 到容器用户 `1000:1000`。
 - 启动：`startSession` 是幂等路径，REST 启动、聊天 WS、终端 WS 都会走它。流程：同步账号池 OAuth 轮换凭证 → `agent.SeedHomeTemplate` 铺 home 模板 → `agent.SeedCredentials` 播种 home → 可选播种内网提示 → 确保用户共享目录 → `dockerx.EnsureRunning` 复用/重建容器 → 更新 SQLite。
-- home 模板：会话 home 每次都是全新空目录，skill / 用户级 MCP / rc 文件本来每开一个会话就得重装一遍，模板就是补这个。两层，后者盖前者：服务器级 `data/home-template/`（全体用户）、用户级 `data/users/<user>/home-template/`（该用户所有会话，「技能」页签写的就是它）。**两层先合并再落盘**，否则用户层里较旧的文件会输给服务器层。合并结果与会话副本之间逐文件按 mtime「谁新用谁」（同 credsync 的收敛规则）：容器里改过的留着，模板更新的推下去；符号链接原样重建、不跟随，可以把大块内容指向 `/shared`。必须排在 `SeedCredentials` 之前，模板里万一混进凭证文件也压不过账号池。模板失败只记日志，不挡会话启动。
+- home 模板：会话 home 每次都是全新空目录，skill / 用户级 MCP / rc 文件本来每开一个会话就得重装一遍，模板就是补这个。两层，后者盖前者：服务器级 `data/home-template/`（全体用户）、用户级 `data/users/<user>/home-template/`（该用户所有会话，「技能」页签写的就是它）。**两层先合并再落盘**，否则用户层里较旧的文件会输给服务器层。合并结果与会话副本之间逐文件按 mtime「谁新用谁」（同 credsync 的收敛规则）：容器里改过的留着，模板更新的推下去；符号链接原样重建、不跟随，可以把大块内容指向 `/shared`。必须排在 `SeedCredentials` 之前，模板里万一混进凭证文件也压不过账号池。模板失败只记日志，不挡会话启动。隧道开启时最底下还有一层内置模板（`internal/agent/builtin/`，`workspace.templateDirs`）：改动其中任何文件都要调大 `agent.BuiltinTemplateTime` 并按 `TestBuiltinTemplateDigest` 的提示更新摘要，否则已有空间收不到新版本。`abox-remote` 的回归是 `policy.abox-remote`（本地 sh 代替 SSH；有 pwsh 时同时测 PowerShell 运行时）。
 - 官方市场（`internal/server/market.go`）：`anthropics/claude-plugins-official` 浅克隆到 `data/marketplace/repo`（12h 过期，整仓重克隆而非增量；拉不动就沿用旧副本），它既是目录数据源也直接提供一方插件的内容。目录条目的 `source` 有四种写法（仓库内相对路径 / git-subdir / url / github），`parsePluginSource` 归一化，路径与协议都当不可信输入校验。**市场的单位是插件不是技能**：`discoverSkillDirs` 按「显式 skills 声明 → skills/<名字>/ → 插件根就是技能」三级找，一个都没有就回 422 并让用户改用终端装整包。git 抓取由 `marketMu` 串行化，`GIT_TERMINAL_PROMPT=0` 防私有仓库卡在密码提示上。
 - 技能页（`internal/server/skills.go` + `web/src/skills.ts`）：管理 `.claude/skills`，范围 `session`（会话 home）与 `template`（用户模板）。列表里的 `source` 靠探测两层模板里有没有同名目录得出，顺序与 SeedHomeTemplate 的分层一致。装／复制统一走 `replaceSkillDir`：整目录替换并把 mtime 戳成当下，保证刚进模板的技能一定比各会话里的旧副本新，下次启动推得下去。技能名同时是目录名，`skillNameRe` 卡死路径穿越。详情接口连整个技能目录的扁平清单（`entries`，含子目录，父在子前，上限 2000 条）一起返回，前端 `buildTree` 拼成左侧文件树；点开单个文件走 `GET …/skills/{name}/file?path=`，路径通过 `s.openDataDir` / `safefs.Root.OpenFile` 固定目录句柄并拒绝符号链接（技能目录在会话 home 里，容器内随手就能造一个指向宿主机文件的链接）。
 - **账号 env 绝不烘进容器**（`dockerx.baseContainerEnv`）：容器 `Config.Env` 在 create 那一刻定死，之后只能靠 exec 往上加、减不掉。账号从中转站切回订阅登录时 `clearClaudeRelay` 只改得动 `config.json`，旧容器里那份 `ANTHROPIC_AUTH_TOKEN` 还在，而 claude CLI 认 env 里的 Bearer 令牌优先于 OAuth 凭证——订阅登录形同虚设，CLI 卡在重试里直到被杀（回合报「进程退出码 137」，stderr 只剩一句 connectors are disabled 的告警）。所以账号 env 一律走 `server.execEnv` 每次 exec 注入，加和减都即时生效。`EnsureRunning` 里的 `hasBakedEnv` 负责认出老版本烘过 env 的容器并重建（比键不比值，镜像升级改 `NODE_VERSION` 的值不算脏）。
@@ -247,6 +247,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' --connect-timeout 10 --max-time 20 "$P
 data/
   state.db
   keepalive-points.json -> 缓存保活的各槽位最新点，重启后接着保活（server/keepalive_store.go）
+  builtin-template/ -> 内置模板层（abox-remote 与其技能，embed 自 internal/agent/builtin/），每次启动重写，不备份
   home-template/   -> 叠加到每个会话 home（skill / MCP / rc 文件）
   users/<user>/
     home-template/ -> 只叠加到该用户的会话，盖住上面那层
@@ -554,6 +555,14 @@ data/
   页面由筛选/合计、独立滚动的明细、常驻底部分页组成，不能把滚动放回 `.usage-body`。
   默认每页 20 条，可选 50 / 100 条；翻页/改筛选重置列表滚动位置，自动轮询保留位置。
   页大小只影响明细请求，合计与 CSV 仍按整个筛选范围计算。
+- 合计条（`usage.ts` 的 `SUMMARY_MAIN` / `SUMMARY_DETAIL`）：卡片只建一次、之后原地改数字，轮询和推送重建节点会丢掉 `?` 的键盘焦点；退出时 `buildSummary` 换新节点，带账号数据的提示随旧节点丢弃。命中率共用 `cacheHitText`，四个桶的顺序让缓存读取落在命中率正下方。
+- **使用趋势图**（`server/usagetrend.go` + `store/usage_trend.go` + `web/src/usage-trend.ts`，照 cc-switch 的
+  `get_daily_trends` / `UsageTrendChart`）：`GET /api/usage/trend` 与明细共用 `usageFilterFrom`，范围一致、普通用户钉死自己。
+  SQLite 不认 IANA 时区，所以 SQL 只按 UTC 刻钟分组（`UsageSlots`，时区偏移都是 15 分钟的倍数），Go 再折叠成
+  `config.timezone` 的钟点/日历桶；别改成按 UTC 小时分组（半小时时区会错位），也别把全部行读进 Go。折叠用按序双指针，
+  柱子之和恒等于合计。范围上限在未来时只画到现在（「当天」不铺后面的空位），两天内按小时、半年内按天、更长按月；
+  `start` 是墙上时间字符串，前端只切片不换算时区。前端无图表依赖，柱子是 flex 里的 div，只有横轴刻度随 ResizeObserver
+  重排；换指标不重新请求、翻页不读趋势、收起时不读。窄屏和高度 ≤760px 首次默认收起，手动切换后按浏览器记忆。
   计费方式并入费用列；窄屏明细纵向展示，字段名来自 `<td>` 的 `data-l`。缓存命中率与 CSV 共用 `usage-math.ts`，分母为未缓存输入 + 缓存读 + 缓存写，无输入显示 —，输出不进分母。
 - **每行「费用」旁的 `?` 是费用明细弹窗**（`usage.ts` 的 `openCost` + `dlg-cost`）：把
   四个 token 桶各自的 `token × 单价` 摊开，末尾对上实收金额，脚注写清计价算法。单价
@@ -865,6 +874,7 @@ data/
 - `tunnel.transparent` 未指定时默认 true，JSON 必须保留显式 false（不能 omitempty），保证兼容模式保存后不会重载成透明模式；客户端同样默认 true，CLI 用 `--transparent=false` 选择兼容。总开关 disabled 时不启动辅助网络。
 - `tunnel.transparent` 启用工作空间透明 IPv4/TCP：`internal/netaccess` 管理规则、虚拟 DNS 与辅助进程，`internal/server/netaccess.go` 管理按用户策略和按空间认证的控制端口，`internal/dockerx/netaccess.go` 管理无用户目录挂载的网络辅助容器。仅辅助容器有 NET_ADMIN，Agent 仍为 UID 1000。
 - 客户端 `--transparent` / 面板开关通过能力协商上报规范化放行规则。透明授权仍由客户端白名单最终检查；账号 HTTP 桥接必须按实际工作空间归属选择隧道，不能仅按共享账号分流。
+- `self.abox-link:<端口>`（`tunnel.SelfHost`）是 abox-link 本机的保留名：服务端当普通域名分配虚拟地址，客户端 `resolveAndCheck` 只认带同一端口的 self 规则并改拨 `127.0.0.1`，不查 DNS、不被网段规则命中；`splitRule`/`ParseWhitelist` 拒绝不带端口的 self 规则。客户端在 `X-Abox-Link-Features: self-target` 上报能力，状态接口返回 `client_self_target`。设计见 `docs/architecture/remote-host.md`。
 - `data/users/<user>/network.json` 保留历史捕获目标与不复用的域名虚拟 IP。掉线、规则撤销、服务重启不能删除捕获规则后静默直连。透明模式退出前停止空间，让网络命名空间重建；不要热清空规则。
 - 透明模式不依赖说明文件或专用代理 env；旧客户端仍保留兼容代理。配置、部署和验收见 `docs/architecture/transparent-network.md`、`docs/networking.md`。真实合成容器测试用 `scripts/test-transparent-network.py`。
 
@@ -876,6 +886,12 @@ data/
   env 镜像进 tmux 全局环境（隧道变量缺失时 `-gu` 清除）——否则「会话先开、隧道后连」时
   终端里的 agent 永远看不到代理变量。运行中的窗格改不了，须重连后新开 tmux 窗口；在旧 Shell 内仅重启 agent 仍会继承旧环境。
 - 端口映射按来源 IP 鉴权：只有属主用户自己的容器（和宿主机）能连映射端口。
+
+### 登录与活跃
+
+- 「系统设置 → 登录与活跃」（`server/login_activity.go`、`store/login_activity.go`，前端 `features/settings/user-activity.ts`）。读接口 `GET /api/user-activity`、`GET /api/login-events` 全部走 `s.admin`；不要把这些字段加进 `/api/me` 或任何普通用户能读到的接口，用户看不到自己的记录是需求本身。
+- 登录记录：每发放一个登录令牌记一行（密码登录 `password`、桌面端配对 `desktop`、abox-link 配对 `abox-link`），新增发放令牌的路径要补 `recordLogin`。失败的登录不记，用户名框里可能是输错位置的密码。写失败只打日志，不挡登录。IP 取 `clientIP`，保留 180 天（`tokenJanitor` 顺带清理）；删除用户时一并删除，同名新账号不继承。
+- 最后活跃 = 用户最后一次在网页上点击或输入，所有页面都算。只认浏览器的真实事件：`human-activity.ts` 在 `document` 捕获阶段监听 `isTrusted` 的 pointerdown/keydown/input/paste/drop，经 `POST /api/me/activity` 上报（不走 `api()`：不闪进度条、失败不打扰用户）。**不能**改用业务信号：Agent 流式输出、终端里跑命令都不是人在操作；xterm 的 `onData` 尤其不行，程序查询光标位置、设备属性时它会自动应答，焦点、鼠标上报同样走这条路。每个标签页 15 秒最多报一次（窗口内的操作在窗口结束时补报，时间最多晚一个窗口），服务端每用户再限 10 秒一次写库（`activityGate`）。上报值由浏览器决定，用户可以自己伪造，只能当参考，不是审计证据。滚动、鼠标移动不算；iframe 里的操作（HTML 预览 `#fv-frame`）事件传不出来，也不算。桌面客户端（`desktop/`）有自己的界面，还没有上报。回归 `scripts/test-user-activity.mjs`、`scripts/test-human-activity.mjs`、`TestActivityReportRecordsTheTokenOwnerAndAnswersNothing`。
 
 ### 系统通告
 
@@ -953,6 +969,7 @@ data/
 - 两套前端互相独立：主控制台在 `internal/web/static`（进 `agentbox`），abox-link 面板在
   `internal/linkapp/static`（进 `abox-link`）。改了面板要重跑 `scripts/build-clients.sh`
   才能让下载按钮发新版；主控制台不受影响，服务端也不用重启。
+- 面板端口被占时，`RunPanel` 用 `/api/state` 的 `version` 判断：同版本交给已有实例并打开它的面板；不同版本（旧版没有这个字段，读到空串）不开浏览器，打印 `replaceNotice` 并等回车后退出。开浏览器会让旧面板盖住提示，看起来像新版没生效；别退回成一律交接。`--daemon` 不打印提示，交给操作系统重试。
 - 改 abox-link 面板前先读 `app.js`：它按 id 直接抓 DOM（`wire`、`wire-rules`、`st-title`、
   `card-pair`、`allow-list`、`savebar` 等），并自己拼类名（`$("wire").className = "wire " + cls`）。
   动 `index.html` 结构时这些 id 必须留着，样式也别挂在被 JS 覆写的类上，否则轮询下一轮就被抹掉。
@@ -1219,6 +1236,7 @@ data/
 - 项目配额按实例及用户创建身份区分 data/cache，不能按共享 UID 1000 限额；新用户和存量根均须准备。挂载 UUID/项目配额能力在创建 data_dir 前验证；root 服务必须去除 CAP_SYS_RESOURCE，防止服务端写入绕过。
 - ext4 属主可清继承标记，quota-managed 容器必须带 ioctl seccomp 限制，保留 Chromium 沙箱；不得仅凭 setquota 成功宣称硬限额。上传/导入暂存放在服务拥有的用户父目录，保持同项目重命名且计入配额。
 - 缓存回收在 workspace 启动锁内确认所有已知容器停止，限 Go 编译/npm 下载缓存，不碰私有模块/浏览器/profile/SDK；扫描不完整不得继续删除。发布保留持部署锁并保护 current、引用和回退版本。
+- 磁盘写入准入分三档（`internal/server/storage_policy.go`）：`storageExemptRoutes` 永远放行，`storageRoutineRoutes` 只守下限 `ResourceLimits.FloorBytes`，其余路由守完整 `min_free_bytes`。两张表按 `r.Pattern` 匹配，改路由要同步（`TestStorageRouteTablesMatchRegisteredRoutes` 会查）；只有确实几乎不写盘或用于止损的路由才能加进去。缓存回收按用户跳过（`workspace.MaintainUser`），不要退回“有一个空间运行就全部跳过”。
 - 专题与验收见 docs/storage-capacity.md、docs/milestones/storage.md；Linux 实测入口 linux.storage-quota 使用独立临时 loop 文件系统，不能对生产目录运行。
 
 ### 主管委派

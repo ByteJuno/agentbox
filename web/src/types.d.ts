@@ -401,6 +401,25 @@ export interface UsageEvents {
   timezone: string;
 }
 
+/** GET /api/usage/trend 的一根柱子。金额同样是微美元整数。 */
+export interface UsageTrendBucket {
+  /** 这一桶的起点：系统时区下的墙上时间 YYYY-MM-DDTHH:mm */
+  start: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_micro_usd: number;
+}
+
+export interface UsageTrend {
+  granularity: "hour" | "day" | "month";
+  /** 连续的桶，没有消耗的时段也有一项；筛选范围内没有任何记录时为空 */
+  buckets: UsageTrendBucket[];
+  timezone: string;
+}
+
 /** GET /api/usage/live 推送的一条用量变更通知（usageLiveNotice）。只带空间 ID；
  *  sessions 为 null 表示变更太多、没有逐个列出。 */
 export interface UsageLiveNotice {
@@ -434,6 +453,25 @@ export interface AnnouncementInput {
   message: string;
   starts_at: number;
   duration_min: number;
+}
+export interface UserActivity {
+  name: string;
+  role: string;
+  last_active_at: number;
+  last_login_at: number;
+  last_login_ip: string;
+}
+export interface LoginEvent {
+  id: number;
+  user: string;
+  at: number;
+  method: string;
+  ip: string;
+  user_agent: string;
+}
+export interface LoginEvents {
+  events: LoginEvent[];
+  has_more: boolean;
 }
 export interface AnnouncementActivity {
   online: { user: string; pages: number }[];
@@ -524,6 +562,8 @@ export interface GitProfile {
 
 /** GET /api/me */
 export interface Me {
+  /** 仅管理员：低于预警线（保留值的两倍）的磁盘。 */
+  storage_low?: { disks: { roles: string[]; available: number }[]; reserve_bytes: number };
   chat_history_timeout_sec?: number;
   draft_scope?:string;
   draft_protocol?:number;
@@ -1225,6 +1265,8 @@ export interface TunnelMap {
 export interface TunnelStatus {
  transparent?: boolean;
  client_transparent?: boolean;
+ /** 客户端能把 self.abox-link 拨到它自己的回环地址 */
+ client_self_target?: boolean;
  network_error?: string;
  rules?: string[];
  workspaces?: {session: string; name: string; ready: boolean; error?: string}[];
