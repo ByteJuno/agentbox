@@ -134,7 +134,9 @@ class Compat:
         self.qcache: dict[str, list] = {}     # 提问 / 审批 id → 题目（结论消息里要带上）
         self.steer_text: dict[str, str] = {}
         self.running: dict[str, str] = {}     # 会话 id → 正在执行的那条消息的回执编号
-        self.history_memo: dict[str, tuple] = {}   # 会话 id → (版本, (整段历史, 费用))
+        self.history_memo: dict[str, tuple] = {}   # 会话 id → (版本, (整段历史, 费用, 每条字节数))
+        self.virtual_memo: dict[str, dict] = {}    # 会话 id → {事件对象 id: (事件, 虚拟化后的条目, 字节数)}
+        self.prefix_memo: dict[str, tuple] = {}    # 冻结前缀文件 → ((mtime, 大小), (cutoff, 条目))
         self.history_lock = threading.Lock()
         self.submit_lock = asyncio.Lock()
         self.dispatch_task = None
@@ -229,6 +231,9 @@ class Compat:
     async def icons(self, request):
         return js({})
 
+    async def activity(self, request):
+        return web.Response(status=204)
+
     async def me(self, request):
         return js({
             "user": OWNER, "role": "admin", "models": {"claude": self.model_options()},
@@ -301,7 +306,7 @@ class Compat:
         _, s = self.thread_session(request)
         if not s:
             return js({"thread_id": request.query.get("thread") or "", "items": []})
-        entries, _ = await asyncio.to_thread(self.history_cached, s)
+        entries, _, _ = await asyncio.to_thread(self.history_cached, s)
         items, last = [], None
         for i, e in enumerate(entries):
             if e["kind"] == "user":
@@ -464,8 +469,7 @@ class Compat:
         if older and not q.get("thread"):
             return problem(400, "invalid_request", "历史分页需要对话编号")
         s = self.hub.sessions.get(tid)
-        full, costs = await asyncio.to_thread(self.history_cached, s) if s else ([], {})
-        sizes = [len(dumps(e).encode()) for e in full]
+        full, costs, sizes = await asyncio.to_thread(self.history_cached, s) if s else ([], {}, [])
         n = len(full)
 
         def index(key, lo, hi):
@@ -546,9 +550,12 @@ class Compat:
         if hit and hit[0] == key:
             return hit[1]
         value = self.build_history(s)
+        self.history_memo.pop(s.id, None)   # 重新插到末尾：淘汰的是最久没看的会话
         self.history_memo[s.id] = (key, value)
         while len(self.history_memo) > 3:
-            self.history_memo.pop(next(iter(self.history_memo)))
+            old = next(iter(self.history_memo))
+            self.history_memo.pop(old)
+            self.virtual_memo.pop(old, None)
         return value
 
     def imported_history(self, s, cutoff):
@@ -559,9 +566,18 @@ class Compat:
         """
         path = self.hub.log_of(s.id).path + ".history2.json"
         try:
+            st = os.stat(path)
+            hit = self.prefix_memo.get(path)
+            if hit and hit[0] == (st.st_mtime_ns, st.st_size):
+                return hit[1]
             with open(path) as f:
                 data = json.load(f)
-            return data["cutoff"], data["entries"]
+            value = data["cutoff"], data["entries"]
+            self.prefix_memo.pop(path, None)
+            self.prefix_memo[path] = ((st.st_mtime_ns, st.st_size), value)
+            while len(self.prefix_memo) > 3:
+                self.prefix_memo.pop(next(iter(self.prefix_memo)))
+            return value
         except (FileNotFoundError, ValueError, KeyError, TypeError):
             pass
         cutoff = cutoff or now_iso()
@@ -608,7 +624,8 @@ class Compat:
         cutoff = None
         if s.adopted or any(e["kind"] in ("assistant", "tool_use") for e in legacy):
             cutoff, prefix = self.imported_history(s, raw_start)
-            entries.extend(prefix)
+            # 前缀条目是缓存共享的；下面会给用户消息补 turn，所以这些要复制
+            entries.extend(dict(x) if x["kind"] == "user" else x for x in prefix)
         merged = []   # 旧段里 hub 才有的条目（提问、审批、插话、每轮结束），按时间插进转录前缀
         for e in events:
             k, ts = e["kind"], iso(e["ts"])
@@ -656,7 +673,28 @@ class Compat:
             head = [x for x in entries if x.get("ts", "") < cutoff]
             tail = entries[len(head):]
             entries = sorted(head + merged, key=lambda x: x.get("ts") or "") + tail
-        return json.loads(self.virtualize(dumps(entries), s.cwd)), costs
+        entries, sizes = self.virtual_entries(s, entries)
+        return entries, costs, sizes
+
+    def virtual_entries(self, s, entries):
+        """路径虚拟化逐条做，Claude 事件按对象缓存（事件行本身由 EventLog 缓存，跨重建是同一个对象）：
+        会话进行中每来一条事件都要重建历史，不能每次把几十 MB 整段序列化、替换、再解析。
+        顺带记下每条的字节数，翻页按字节截断时不用再序列化一遍。"""
+        old = self.virtual_memo.get(s.id) or {}
+        memo, out, sizes = {}, [], []
+        for e in entries:
+            ev = e.get("event") if e["kind"] == "event" else None
+            key = (id(ev), e.get("state"), e.get("ts")) if ev is not None else None
+            hit = old.get(key) if key else None
+            if hit is None or hit[0] is not ev:
+                text = self.virtualize(dumps(e), s.cwd)
+                hit = (ev, json.loads(text), len(text.encode()))
+            if key:
+                memo[key] = hit
+            out.append(hit[1])
+            sizes.append(hit[2])
+        self.virtual_memo[s.id] = memo
+        return out, sizes
 
     # ---- hub 事件 → agentbox 的对话消息、回执状态 ----
 
@@ -1216,14 +1254,36 @@ def register(app, api):
                     q.get_nowait()
                 q.put_nowait(None)
 
+    async def prewarm(app):
+        """重启（部署）后第一次打开长对话要整段冷构建，几十 MB 的会话要好几秒；后台先把最近的几个建好。"""
+        async def run():
+            await asyncio.sleep(3)
+            recent = sorted(c.hub.sessions.values(), key=lambda s: s.updated or 0, reverse=True)[:3]
+            for s in recent:
+                try:
+                    await asyncio.to_thread(c.history_cached, s)
+                except Exception:   # 预热失败无所谓，打开时照常现建
+                    pass
+        c.prewarm_task = asyncio.create_task(run())
+
+    async def stop_prewarm(app):
+        task = getattr(c, "prewarm_task", None)
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     app.on_startup.append(start_queue)
+    app.on_startup.append(prewarm)
     app.on_shutdown.append(close_rooms)
+    app.on_shutdown.append(stop_prewarm)
     r = app.router
     r.add_post("/api/login", c.login)
     r.add_post("/api/logout", c.logout)
     r.add_get("/api/ping", c.ping)
     r.add_get("/api/icons", c.icons)
     r.add_get("/api/me", c.me)
+    # 上游用来记「最后活跃」给管理员看；单人版不记，照上游回 204，免得每次点击都留一条 404
+    r.add_post("/api/me/activity", c.activity)
     r.add_get("/api/sessions/{id}/models", c.models)
     r.add_get("/api/sessions/{id}/chat/threads", c.threads)
     r.add_post("/api/sessions/{id}/chat/threads", c.thread_new)

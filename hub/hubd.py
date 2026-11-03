@@ -36,6 +36,7 @@ AGENT_HUB_MAX_TURNS（一轮最多几步，默认 30）、AGENT_HUB_SYSTEM_APPEN
 （result.total_cost_usd 是 Claude Code 会话的累计值，不能按轮相加）。
 """
 import asyncio
+import collections
 import errno
 import hashlib
 import html
@@ -45,6 +46,7 @@ import re
 import secrets
 import shutil
 import signal
+import threading
 import sys
 import time
 import traceback
@@ -54,7 +56,7 @@ import urllib.request
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 
-from aiohttp import web
+from aiohttp import hdrs, web
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -443,13 +445,45 @@ class EventLog:
             f.write(json.dumps(ev, ensure_ascii=False) + "\n")
 
     def read(self, after=0, limit=None):
-        try:
-            with open(self.path) as f:
-                rows = [json.loads(line) for line in f if line.strip()]
-        except FileNotFoundError:
-            return []
-        rows = [r for r in rows if r["seq"] > after]
+        """返回的行是共享的缓存，调用方只读不改。"""
+        rows = self.rows()
+        if after:
+            rows = [r for r in rows if r["seq"] > after]
         return rows[-limit:] if limit else rows
+
+    def rows(self):
+        """事件文件只追加：按偏移只解析新增的整行，长对话进行中反复读历史时不用每次重解析几十 MB。
+        文件被删或变短（删会话后重建）就整份重读；没写完的半行留到下次。"""
+        with _ROWS_LOCK:
+            try:
+                st = os.stat(self.path)
+            except FileNotFoundError:
+                _ROWS.pop(self.path, None)
+                return []
+            hit = _ROWS.get(self.path)
+            if not hit or hit[0] != st.st_ino or st.st_size < hit[1]:
+                hit = (st.st_ino, 0, [])
+            ino, offset, rows = hit
+            if st.st_size > offset:
+                with open(self.path, "rb") as f:
+                    f.seek(offset)
+                    data = f.read(st.st_size - offset)
+                end = data.rfind(b"\n") + 1
+                if end:
+                    # 新列表而不是原地追加：之前返回出去的列表不会被改动
+                    # 只按 \n 切：splitlines 还会切在 U+2028 之类的字符上，事件正文里原样带着这些字符
+                    rows = rows + [json.loads(line) for line in data[:end].split(b"\n") if line.strip()]
+                    offset += end
+            _ROWS[self.path] = (ino, offset, rows)
+            _ROWS.move_to_end(self.path)
+            while len(_ROWS) > ROWS_CACHED_LOGS:
+                _ROWS.popitem(last=False)
+            return rows
+
+
+ROWS_CACHED_LOGS = 4   # 只缓存最近读过的几个会话
+_ROWS: "collections.OrderedDict[str, tuple]" = collections.OrderedDict()
+_ROWS_LOCK = threading.Lock()
 
 
 def offer(q, ev):
@@ -1659,6 +1693,10 @@ PUBLIC_PATHS = {"/api/login", "/api/ping", "/api/icons", "/hub/login", "/hub/tok
 BUILD = str(int(time.time()))   # 静态资源 URL 里的版本号：hub 重启就换，浏览器不会用到旧缓存
 
 
+COMPRESS_MIN = 16 << 10
+COMPRESS_TYPES = {"application/json", "text/html", "text/plain", "text/css", "application/javascript", "text/javascript"}
+
+
 def http_app(hub, token):
     def authorized(request):
         bearer = request.headers.get("Authorization", "")
@@ -1811,7 +1849,19 @@ def http_app(hub, token):
     async def dirs(request):
         return ok(await hub.cmd_dirs({"path": request.query.get("path")}))
 
-    app = web.Application(middlewares=[guard], client_max_size=4 << 20)
+    @web.middleware
+    async def compress_large(request, handler):
+        """大块文本（历史分页常有 1MB、首页 250KB）在浏览器支持时压缩：手机走 Tailscale 慢网能省下大半流量。
+        只动还没发出去的普通 Response；WebSocket（自带 permessage-deflate）、SSE、静态文件不碰。"""
+        resp = await handler(request)
+        if (type(resp) is web.Response and not resp.prepared and resp.body is not None
+                and isinstance(resp.body, (bytes, bytearray)) and len(resp.body) >= COMPRESS_MIN
+                and hdrs.CONTENT_ENCODING not in resp.headers
+                and (resp.content_type or "").split(";")[0] in COMPRESS_TYPES):
+            resp.enable_compression()
+        return resp
+
+    app = web.Application(middlewares=[guard, compress_large], client_max_size=4 << 20)
     r = app.router
     r.add_get("/", index)
     r.add_get("/_v/{build}/{tail:.+}", versioned)

@@ -1,5 +1,5 @@
 /* agent-hub 对 agentbox 原版前端的唯一改动：藏起 lab 单人版用不上的入口（文件不改，服务时注入这份样式）。
-   浏览器标签（远程浏览器要另装镜像）、内网隧道、扩展，以及设置里只对团队 / 容器有意义的分区。 */
+   浏览器标签（远程浏览器要另装镜像）、内网隧道、扩展，以及设置里只对团队 / 容器有意义的分区（含多用户的登录记录）。 */
 .tab[data-tab="browser"],
 #btn-tunnel,
 #btn-extensions,
@@ -10,6 +10,7 @@
 #settings-nav [data-sec="icons"],
 #settings-nav [data-sec="security"],
 #settings-nav [data-sec="announce"],
+#settings-nav [data-sec="logins"],
 button[data-sec="proxies"],
 button[data-sec="container"],
 button[data-sec="models"],
@@ -17,6 +18,7 @@ button[data-sec="decision"],
 button[data-sec="icons"],
 button[data-sec="security"],
 button[data-sec="announce"],
+button[data-sec="logins"],
 /* 10-27 机主删掉的功能：MCP 页、技能的官方市场、新建空间时的上传 / Git 导入、Git 远程 / 分支 / 克隆 / 仓库连接 */
 .tab[data-tab="mcp"],
 #skill-src-market,

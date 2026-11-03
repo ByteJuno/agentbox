@@ -268,7 +268,8 @@ class Spaces:
                            "key": next(k for k in self.prices if model.startswith(k)), "basis": "table"}
         return row
 
-    def usage_events(self, q):
+    def usage_filter(self, q):
+        """/usage/events 与 /usage/trend 共用的筛选口径（照上游 usageFilterFrom），柱子之和等于表格合计。"""
         rows = self.usage_all()
         wid = q.get("session")
         path = (self.hub.workspaces.items.get(wid) or {}).get("path") if wid else None
@@ -277,6 +278,63 @@ class Spaces:
         hit = [r for r in rows if (not wid or r.get("cwd") == path) and (not model or r.get("model") == model)
                and (not kind or kind == "chat") and (not agent or agent == "claude")
                and (since is None or r["ts"] >= since) and (until is None or r["ts"] < until)]
+        return rows, hit, since, until
+
+    def usage_trend(self, q, now=None):
+        """使用记录页的柱状图，照上游 usagetrend.go：两天内按小时、半年内按天、再长按月，
+        按系统时区的钟点和日历切桶；空时段也补空桶；范围上限在未来时只画到现在。"""
+        _, hit, since, until = self.usage_filter(q)
+        tz = zoneinfo.ZoneInfo(self.prefs().get("timezone", TIMEZONE))
+        out = {"granularity": "hour", "buckets": [], "timezone": self.prefs().get("timezone", TIMEZONE)}
+        if not hit:
+            return out
+        hit = sorted(hit, key=lambda r: r["ts"])
+        slot = 15 * 60   # 上游按 UTC 刻钟槽汇总，轴至少延伸到最后一条记录所在刻钟的末尾
+        now = time.time() if now is None else now
+        end = min(now, until) if until is not None else now
+        end = max(end, (hit[-1]["ts"] // slot + 1) * slot)
+        start = since if since is not None and end - since <= 186 * 86400 else hit[0]["ts"] // slot * slot
+        local = datetime.datetime.fromtimestamp(start, tz)
+        span = end - start
+        if span <= 48 * 3600:
+            gran, first = "hour", local.replace(minute=0, second=0, microsecond=0)
+        elif span <= 186 * 86400:
+            gran, first = "day", local.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            gran, first = "month", local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        def step(t):   # 按墙上时间走，夏令时那天的小时 / 天也落在对的钟点上
+            if gran == "hour":
+                return datetime.datetime.fromtimestamp(t.timestamp() + 3600, tz).replace(minute=0, second=0, microsecond=0)
+            if gran == "day":
+                return (t.replace(tzinfo=None) + datetime.timedelta(days=1)).replace(tzinfo=tz)
+            return t.replace(year=t.year + 1, month=1) if t.month == 12 else t.replace(month=t.month + 1)
+
+        starts, t = [], first
+        while t.timestamp() < end:
+            starts.append(t.timestamp())
+            out["buckets"].append({"start": t.strftime("%Y-%m-%dT%H:%M"), "requests": 0, "input_tokens": 0,
+                                   "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
+                                   "cost_micro_usd": 0})
+            t = step(t)
+        i = 0
+        for r in hit:
+            while i + 1 < len(starts) and r["ts"] >= starts[i + 1]:
+                i += 1
+            b = out["buckets"][i]
+            b["requests"] += 1
+            b["input_tokens"] += r.get("input") or 0
+            b["output_tokens"] += r.get("output") or 0
+            b["cache_read_tokens"] += r.get("cache_read") or 0
+            b["cache_write_tokens"] += r.get("cache_write") or 0
+            b["cost_micro_usd"] += r.get("cost") or 0   # 先累加美元，最后再取整，和表格合计同口径
+        for b in out["buckets"]:
+            b["cost_micro_usd"] = round(b["cost_micro_usd"] * 1e6)
+        out["granularity"] = gran
+        return out
+
+    def usage_events(self, q):
+        rows, hit, since, until = self.usage_filter(q)
         asc = q.get("order") == "asc"
         hit.sort(key=lambda r: r["ts"], reverse=not asc)
         try:
@@ -582,6 +640,9 @@ def register(app, api):
     async def usage_events(request):
         return js(await asyncio.to_thread(sp.usage_events, request.query), headers={"Cache-Control": "no-store"})
 
+    async def usage_trend(request):
+        return js(await asyncio.to_thread(sp.usage_trend, request.query), headers={"Cache-Control": "no-store"})
+
     async def usage_live(request):
         wsr = web.WebSocketResponse(heartbeat=30)
         await wsr.prepare(request)
@@ -789,6 +850,7 @@ def register(app, api):
     r.add_get("/api/onboarding", onboarding)
     r.add_get("/api/usage/events", usage_events)
     r.add_get("/api/usage/live", usage_live)
+    r.add_get("/api/usage/trend", usage_trend)
     r.add_get("/api/settings", settings_get)
     r.add_put("/api/settings", settings_put)
     r.add_get("/api/system", system)

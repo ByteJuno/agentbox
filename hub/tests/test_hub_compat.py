@@ -396,7 +396,7 @@ class CompatTest(unittest.IsolatedAsyncioTestCase):
         raw = {"seq": 0, "kind": "agent_event", "ts": time.time(), "event": {"type": "assistant", "message": {"content": []}}}
         with patch.object(log, "read", return_value=events + legacy + [raw]), \
                 patch.object(hub_abx, "read_transcript_full", return_value=prefix):
-            entries, _ = self.c.build_history(s)
+            entries, _, _ = self.c.build_history(s)
         kinds = [(e["kind"], (e.get("event") or {}).get("type")) for e in entries]
         self.assertIn(("event", "assistant"), kinds[:3])          # 转录里的完整工具调用
         self.assertEqual(entries[[k for k, _ in kinds].index("status")]["ts"], hub_abx.iso(legacy_ts + 2))
