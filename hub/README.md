@@ -22,6 +22,7 @@
 | `hub_files.py` | 文件页、聊天附件、HTML 预览直链、@ 文件搜索 |
 | `hub_git.py` | 变更页：状态、diff、提交、丢弃 |
 | `hub_term.py` + `tmux.conf` | 网页终端：每个空间一个 tmux 会话 |
+| `hub_claude_auth.py` | 网页查看 Claude Code 登录状态、发起官方订阅登录（PTY；链接和授权码只在内存里） |
 | `hub_skills.py` | 技能页（本地上传、查看、复制、删除） |
 | `hub_workspaces.py` | 工作空间登记（`/hub/workspaces`） |
 | `agentctl` | 命令行，本机调试用 |
@@ -66,6 +67,17 @@ agentctl token        # 网页登录和 Eta 用的令牌，只在自己终端里
   只靠 cookie 的写请求必须来自本站页面。HTML 预览走单独的只读预览直链（只限那一个目录、30 分钟过期、
   沙箱里拿不到令牌）。
 - 权限模式默认 bypassPermissions（全部自动通过）；网页上能用终端，等于这台机器的 shell。
+- Claude 登录：只把 Anthropic 官方的 `claude.com/cai/oauth/authorize`（或 `platform.claude.com/oauth/authorize`）
+  链接交给页面，链接和授权码不写日志、不落盘；授权码输入框是密码框，提交后立即清空；
+  `claude auth status` 只取白名单字段，email 遮罩。hub 不 logout、不主动刷新 token、不读凭据文件。
+
+## Claude 登录（网页）
+
+网页 → 设置 → 账号池 → 「lab 主机 Claude 登录」：看当前状态；需要登录或换账号时点「获取官方登录链接」，
+在 Anthropic 官方页面由本人完成授权，把页面显示的整行授权码（`code#state`）粘回受保护输入框。
+服务器只跑固定命令 `claude auth login --claudeai`，授权码经 PTY 交给 CLI；成功后用
+`claude auth status --json` 复核，只有 `loggedIn: true` 才显示已登录。链接 10 分钟过期，同一时间只允许一个流程，
+取消/超时会结束整个进程组。
 
 ## hub 自己的接口（Eta、脚本用）
 
@@ -87,6 +99,11 @@ agentctl token        # 网页登录和 Eta 用的令牌，只在自己终端里
 | POST | `/hub/questions/{qid}` | 回答提问 `{answers: {问题原文: 选项 label 或数组}}`，或 `{skip: true}` |
 | GET | `/hub/stream` | 所有会话的状态、审批、提问、结果（列表页、通知用） |
 | GET | `/hub/dirs?path=` | 选目录（只能选 home 下面的） |
+| GET | `/hub/claude-auth/status` | Claude 登录状态（email 遮罩）+ 当前流程；`force=1` 跳过 3 秒缓存 |
+| GET | `/hub/claude-auth/flow` | 当前登录流程（阶段、过期时间、错误；永远不含链接） |
+| POST | `/hub/claude-auth/start` | 起一次官方登录，返回一次 `authorizeUrl`；已有流程时 409 |
+| POST | `/hub/claude-auth/code` | 提交授权码 `{code: "code#state"}`；不回显、不保存 |
+| POST | `/hub/claude-auth/cancel` | 取消当前流程并结束进程组 |
 | GET/POST/PATCH/DELETE | `/hub/workspaces…` | 工作空间 |
 
 `/api/…` 是给 agentbox 前端的，格式以它的 `web/src/types.d.ts` 为准。
