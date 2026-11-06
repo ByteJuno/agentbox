@@ -164,6 +164,10 @@
     cancelBtn.hidden = true;
     startBtn.hidden = false;
     codeInput.value = "";   // 不管结果如何都不留授权码
+    link.removeAttribute("href");   // 链接只活到这次流程结束，不留在 DOM 里
+    link.textContent = "";
+    link.removeAttribute("data-flow");
+    copyBtn.hidden = true;
     submitBtn.disabled = false;
     if (flow.phase === "succeeded") msg.textContent = "登录成功：claude auth status 已显示已登录。";
     else if (flow.phase === "cancelled") msg.textContent = "已取消这次登录。";
