@@ -79,6 +79,7 @@
     } else {
       bits.push("未登录时 Claude 会话无法在这台机器上运行");
     }
+    if (startBtn) startBtn.textContent = logged ? "重新登录（获取官方链接）" : "获取官方登录链接";
     if (data.checkedAt) bits.push("检查于 " + new Date(data.checkedAt).toLocaleTimeString());
     detail.textContent = bits.join(" · ");
   }
@@ -179,7 +180,7 @@
     card.id = "claude-auth-card";
     card.appendChild(node("h3", "", "lab 主机 Claude 登录"));
     card.appendChild(node("p", "card-desc",
-      "查看 Claude Code 在这台机器上的登录状态。需要登录时只生成 Anthropic 官方的授权链接，由你本人在官方页面完成；hub 不接触密码，不保存授权码。"));
+      "查看 Claude Code 在这台机器上的登录状态。需要登录时只生成 Anthropic 官方的授权链接，由你本人在官方页面完成；hub 不接触密码，不保存授权码。已经登录时也可以重新走一遍，成功后才替换现有登录。"));
 
     var state = node("div", "ca-state");
     badge = node("span", "ca-badge ca-unknown", "读取中…");
