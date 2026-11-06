@@ -35,3 +35,25 @@ button[data-git-sec="connections"],
    账号池只读，不能展示会报错的新增/认证/编辑入口。 */
 #term-new, #btn-acct-add, .acct-actions, .acct-models-link,
 #set-keepalive, #btn-change-password { display: none !important; }
+
+/* 设置 → 账号池：lab 主机 Claude 登录卡片（claude-auth.js 注入的 DOM）。 */
+.ca-card .card-desc { margin-bottom: 8px; }
+.ca-state { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 2px; }
+.ca-badge { display: inline-flex; align-items: center; padding: 3px 10px; border: 1px solid var(--line);
+  border-radius: var(--radius-pill, 999px); font-size: 12px; line-height: 1.5; white-space: nowrap; }
+.ca-badge.ca-on { color: var(--green); border-color: var(--green-line, var(--green)); }
+.ca-badge.ca-off { color: var(--amber); border-color: var(--amber-dim, var(--amber)); }
+.ca-badge.ca-unknown { color: var(--muted); }
+.ca-detail { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.ca-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.ca-flow { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line-soft, var(--line)); }
+.ca-url { display: block; margin: 8px 0; padding: 8px 10px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--code-bg, transparent); font-family: var(--mono, monospace);
+  font-size: 12px; line-height: 1.5; word-break: break-all; color: var(--accent); }
+.ca-url:not([href]) { color: var(--muted); }
+.ca-copy { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ca-code-field { margin-top: 10px; }
+.ca-copy .note, .ca-expiry { margin: 0; }
+.ca-msg { margin-top: 8px; }
+.ca-msg:empty { display: none; }
+.ca-card [hidden] { display: none !important; }

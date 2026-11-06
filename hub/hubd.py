@@ -78,6 +78,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk._internal.message_parser import parse_message
 
 import hub_abx
+import hub_claude_auth
 import hub_files
 import hub_git
 import hub_optional
@@ -1760,7 +1761,8 @@ def http_app(hub, token):
             page = f.read().replace("{{BUILD}}", BUILD)
         # 原版前端一个字不改；只在这里注入 hub 自己的一小段样式和脚本（藏起单人版用不上的入口）
         page = page.replace("</head>", f'<link rel="stylesheet" href="/web/hub/hub.css?v={BUILD}">'
-                                       f'<script src="/web/hub/hub.js?v={BUILD}" defer></script></head>', 1)
+                                       f'<script src="/web/hub/hub.js?v={BUILD}" defer></script>'
+                                       f'<script src="/web/hub/claude-auth.js?v={BUILD}" defer></script></head>', 1)
         return web.Response(text=page, content_type="text/html", headers={"Cache-Control": "no-cache"})
 
     async def versioned(request):
@@ -1887,7 +1889,8 @@ def http_app(hub, token):
     r.add_get("/hub/stream", stream_all)
     r.add_get("/hub/dirs", dirs)
     api = types.SimpleNamespace(hub=hub, ok=ok, body=body, via=via, Error=HubError, token=token)
-    for mod in (hub_workspaces, hub_files, hub_git, hub_skills, hub_term, hub_abx, hub_spaces, hub_optional):   # 各功能模块自己挂路由
+    for mod in (hub_workspaces, hub_files, hub_git, hub_skills, hub_term, hub_abx, hub_spaces, hub_optional,
+                hub_claude_auth):   # 各功能模块自己挂路由
         mod.register(app, api)
     return app
 
